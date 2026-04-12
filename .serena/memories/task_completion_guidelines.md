@@ -1,50 +1,27 @@
-# Task Completion Guidelines
+# Task Completion Guidelines - BTRBK TUI
 
-## When a Task is Completed
+## Dopo Modifiche al Codice
 
-### Code Changes
-1. **Test the changes**:
-   ```bash
-   # For Python changes
-   sudo ./btrbk_restore.py  # Test CLI
-   sudo ./btrbk_restore_tui_pro.py  # Test TUI Pro
-   
-   # For Rust changes
-   cd btrbk_tui_rust
-   cargo build --release
-   sudo ./target/release/btrbk_restore
-   ```
+### Verifica Python
+```bash
+python3 -m py_compile btrbk_tui.py
+python3 -m py_compile btrbk_tui_pro.py
+sudo ./btrbk_tui.py
+sudo ./btrbk_tui_pro.py
+```
 
-2. **Check syntax and build**:
-   ```bash
-   # Python syntax check
-   python3 -m py_compile btrbk_restore.py
-   python3 -m py_compile btrbk_restore_tui_pro.py
-   
-   # Rust build check
-   cd btrbk_tui_rust && cargo check
-   ```
+### Verifica Rust
+```bash
+cd btrbk_tui_rust && cargo check
+cargo build --release
+sudo ./target/release/btrbk_tui
+```
 
-### Documentation Updates
-- Update README.md if new features or changes affect usage
-- Update version numbers in Cargo.toml if Rust changes
-- Ensure desktop file is updated if entry points change
-
-### Version Consistency
-- Maintain feature parity between Python TUI Pro and Rust versions
-- Ensure shared configuration compatibility
-- Test configuration file loading/saving
-
-### Security Considerations
-- All tools require root privileges (sudo)
-- Test with actual btrfs snapshots when possible
-- Verify backup creation (.BROKEN files) works correctly
-
-### Final Checks
-- Verify executable permissions: `chmod +x *.py`
-- Test on actual btrfs system if available
-- Ensure error handling works for missing directories
-- Check that configuration file creation works
-
-## No Automated Testing
-This project doesn't have automated tests - testing is done manually with actual btrfs snapshots.
+## Regole Generali
+- Mantenere parità funzionale tra Python TUI Pro e Rust
+- Garantire compatibilità schema JSON config condiviso
+- Aggiornare README.md per nuove funzionalità
+- Verificare permessi eseguibili: `chmod +x *.py`
+- Nessun test automatizzato - testing manuale con snapshot btrfs reali
+- Tutte le operazioni richiedono root (sudo)
+- Verificare che backup `.BROKEN` funzioni correttamente

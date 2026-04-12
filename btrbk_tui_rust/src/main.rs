@@ -265,40 +265,46 @@ impl App {
                     match rx.try_recv() {
                         Ok(line_content) => {
                             if !line_content.trim().is_empty() {
-                                // Clean line: rimuovi caratteri di controllo e normalizza
-                                let cleaned_line = line_content
-                                    .replace('\r', "")  // Rimuovi carriage return
-                                    .replace('\x1b', "") // Rimuovi escape sequences
-                                    .chars()
-                                    .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
-                                    .collect::<String>();
-                                
-                                // Se la riga contiene progresso (in/out), sostituisci l'ultima riga invece di aggiungerne una nuova
-                                if cleaned_line.contains("in @") && cleaned_line.contains("out @") {
-                                    // Sostituisci l'ultima riga se esiste
-                                    if !output_lines.is_empty() {
-                                        output_lines.pop();
+                                // Clean line: strip ANSI escape sequences and control chars
+                                let mut cleaned = String::new();
+                                let mut chars = line_content.chars().peekable();
+                                while let Some(c) = chars.next() {
+                                    if c == '\x1b' {
+                                        // Skip entire ANSI sequence: ESC[ ... final_byte
+                                        if chars.peek() == Some(&'[') {
+                                            chars.next();
+                                            while let Some(&nc) = chars.peek() {
+                                                chars.next();
+                                                if nc.is_ascii_alphabetic() || nc == '~' { break; }
+                                            }
+                                        }
+                                    } else if c == '\r' {
+                                        continue;
+                                    } else if c.is_ascii_graphic() || c == ' ' {
+                                        cleaned.push(c);
                                     }
                                 }
                                 
-                                output_lines.push(cleaned_line.clone());
+                                if cleaned.trim().is_empty() { continue; }
                                 
-                                // Display the line in the output area
+                                // Progress lines: replace last line
+                                if cleaned.contains("in @") && cleaned.contains("out @") {
+                                    if !output_lines.is_empty() { output_lines.pop(); }
+                                }
+                                
+                                output_lines.push(cleaned.clone());
+                                
                                 let display_y = output_start_y + output_lines.len() as i32 - 1 - current_line;
                                 if display_y >= output_start_y && display_y < output_start_y + output_height {
-                                    // Truncate line if too long
-                                    let display_line = if cleaned_line.len() > width as usize {
-                                        &cleaned_line[..width as usize]
+                                    let display_line = if cleaned.len() > width as usize {
+                                        &cleaned[..width as usize]
                                     } else {
-                                        &cleaned_line
+                                        &cleaned
                                     };
-                                    
-                                    // Clear line and add content (full width)
                                     mvaddstr(display_y, 0, &" ".repeat(width as usize));
                                     mvaddstr(display_y, 0, display_line);
                                 }
                                 
-                                // Auto-scroll if needed
                                 if output_lines.len() > output_height as usize {
                                     current_line = output_lines.len() as i32 - output_height;
                                 }
@@ -312,32 +318,40 @@ impl App {
                                 // Process finished, drain remaining messages
                                 while let Ok(line_content) = rx.try_recv() {
                                     if !line_content.trim().is_empty() {
-                                        // Clean line: rimuovi caratteri di controllo e normalizza
-                                        let cleaned_line = line_content
-                                            .replace('\r', "")  // Rimuovi carriage return
-                                            .replace('\x1b', "") // Rimuovi escape sequences
-                                            .chars()
-                                            .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
-                                            .collect::<String>();
-                                        
-                                        // Se la riga contiene progresso (in/out), sostituisci l'ultima riga invece di aggiungerne una nuova
-                                        if cleaned_line.contains("in @") && cleaned_line.contains("out @") {
-                                            // Sostituisci l'ultima riga se esiste
-                                            if !output_lines.is_empty() {
-                                                output_lines.pop();
+                                        // Clean line: strip ANSI escape sequences and control chars
+                                        let mut cleaned = String::new();
+                                        let mut chars = line_content.chars().peekable();
+                                        while let Some(c) = chars.next() {
+                                            if c == '\x1b' {
+                                                if chars.peek() == Some(&'[') {
+                                                    chars.next();
+                                                    while let Some(&nc) = chars.peek() {
+                                                        chars.next();
+                                                        if nc.is_ascii_alphabetic() || nc == '~' { break; }
+                                                    }
+                                                }
+                                            } else if c == '\r' {
+                                                continue;
+                                            } else if c.is_ascii_graphic() || c == ' ' {
+                                                cleaned.push(c);
                                             }
                                         }
                                         
-                                        output_lines.push(cleaned_line.clone());
+                                        if cleaned.trim().is_empty() { continue; }
+                                        
+                                        if cleaned.contains("in @") && cleaned.contains("out @") {
+                                            if !output_lines.is_empty() { output_lines.pop(); }
+                                        }
+                                        
+                                        output_lines.push(cleaned.clone());
                                         
                                         let display_y = output_start_y + output_lines.len() as i32 - 1 - current_line;
                                         if display_y >= output_start_y && display_y < output_start_y + output_height {
-                                            let display_line = if cleaned_line.len() > width as usize {
-                                                &cleaned_line[..width as usize]
+                                            let display_line = if cleaned.len() > width as usize {
+                                                &cleaned[..width as usize]
                                             } else {
-                                                &cleaned_line
+                                                &cleaned
                                             };
-                                            
                                             mvaddstr(display_y, 0, &" ".repeat(width as usize));
                                             mvaddstr(display_y, 0, display_line);
                                         }
@@ -540,7 +554,7 @@ impl App {
     fn draw_header(&self) {
         let (_, width) = get_max_yx();
         
-        let title = "BTRBK TUI v2.5";
+        let title = "BTRBK TUI v2.6";
         attron(COLOR_PAIR(5) | A_BOLD());
         let centered_title = format!("{:^width$}", title, width = width as usize);
         mvaddstr(0, 0, &centered_title[..std::cmp::min(centered_title.len(), width as usize - 1)]);
@@ -796,7 +810,7 @@ impl App {
     }
     
     fn verify_restore_success(&self, restored_subvol: &Path, snapshot_type: &str) -> bool {
-        // 1. Verifica che il subvolume esista ed sia effettivamente un subvolume btrfs
+        // 1. Verifica che il subvolume esista
         if !restored_subvol.exists() {
             return false;
         }
@@ -809,16 +823,12 @@ impl App {
         // 3. Verifica file/directory critici in base al tipo di subvolume
         match snapshot_type {
             "root" => {
-                // Per il root, verifica directory essenziali
                 let critical_dirs = ["etc", "usr", "var", "bin"];
                 for dir in &critical_dirs {
-                    let dir_path = restored_subvol.join(dir);
-                    if !dir_path.exists() {
+                    if !restored_subvol.join(dir).exists() {
                         return false;
                     }
                 }
-                
-                // Verifica file critici
                 let critical_files = ["etc/fstab", "etc/passwd"];
                 for file in &critical_files {
                     let file_path = restored_subvol.join(file);
@@ -828,27 +838,24 @@ impl App {
                 }
             }
             "home" => {
-                // Per home, verifica che non sia vuoto (dovrebbe avere almeno qualche directory utente)
                 match fs::read_dir(restored_subvol) {
                     Ok(entries) => {
                         if entries.count() == 0 {
-                            return false; // Home vuota è sospetta
+                            return false;
                         }
                     }
                     Err(_) => return false,
                 }
             }
-            "games" => {
-                // Per games, verifica che la directory esista e sia accessibile
-                match fs::read_dir(restored_subvol) {
-                    Ok(_) => {}, // OK se riusciamo a leggere la directory
-                    Err(_) => return false,
+            _ => {
+                // Per qualsiasi altro tipo (@games, @work, @custom, ecc.):
+                // verifica solo che sia leggibile
+                if fs::read_dir(restored_subvol).is_err() {
+                    return false;
                 }
             }
-            _ => return false,
         }
         
-        // 4. Test finale: il subvolume è valido se ha superato tutti i controlli precedenti
         true
     }
     
@@ -912,70 +919,63 @@ impl App {
                 self.selected_row = 0;
             }
             114 | 82 => {  // 'r' or 'R'
-                // Always refresh
-                self.set_status("Operation cancelled", 30);
+                self.set_status("Snapshots refreshed", 30);
             }
             104 | 72 => {  // 'h' or 'H'
-                // Reboot if needed
                 if self.reboot_needed {
                     if self.confirm_dialog("Reboot system now?") {
                         run_command(&["reboot"]);
                     } else {
-                        self.set_status("Operation cancelled", 30);
+                        self.set_status("Reboot cancelled", 30);
                     }
-                } else {
-                    self.set_status("Operation cancelled", 30);
                 }
             }
             112 | 80 => {  // 'p' or 'P'
-                // Purge old snapshots
                 if self.confirm_dialog("Purge old snapshots (keep only most recent)?") {
-                    self.set_status("Processing...", 30);
+                    self.set_status("Purging old snapshots...", 30);
                     refresh();
                     
                     let (deleted_count, _deleted_list) = self.purge_old_snapshots();
                     
                     if deleted_count == -1 {
-                        self.set_status("Processing...", 30);
+                        self.set_status("Error: cannot read snapshots directory", 100);
                     } else if deleted_count == 0 {
-                        self.set_status("Processing...", 30);
+                        self.set_status("No old snapshots to purge", 50);
                     } else {
                         self.set_status(&format!("Purged {} old snapshots successfully", deleted_count), 150);
                     }
                 } else {
-                    self.set_status("Operation cancelled", 30);
+                    self.set_status("Purge cancelled", 30);
                 }
             }
             98 | 66 => {  // 'b' or 'B'
-                // Clean all .BROKEN subvolumes
                 if self.confirm_dialog("Delete all .BROKEN subvolumes?") {
-                    self.set_status("Processing...", 30);
+                    self.set_status("Cleaning .BROKEN subvolumes...", 30);
                     refresh();
                     
                     let (deleted_count, _deleted_list) = self.clean_broken_subvolumes();
                     
                     if deleted_count == -1 {
-                        self.set_status("Processing...", 30);
+                        self.set_status("Error: cannot read pool directory", 100);
                     } else if deleted_count == 0 {
-                        self.set_status("Processing...", 30);
+                        self.set_status("No .BROKEN subvolumes found", 50);
                     } else {
                         self.set_status(&format!("Cleaned {} .BROKEN subvolumes successfully", deleted_count), 150);
                     }
                 } else {
-                    self.set_status("Operation cancelled", 30);
+                    self.set_status("Clean cancelled", 30);
                 }
             }
             105 | 73 => {  // 'i' or 'I'
-                // Create new snapshots
                 if self.confirm_dialog("Create new snapshots with btrbk?") {
                     let (success, message) = self.create_snapshot();
                     if success {
-                        self.set_status("Snapshots created successfully", 30);
+                        self.set_status("Snapshots created successfully", 100);
                     } else {
                         self.set_status(&format!("Snapshot creation failed: {}", message), 150);
                     }
                 } else {
-                    self.set_status("Operation cancelled", 30);
+                    self.set_status("Snapshot creation cancelled", 30);
                 }
             }
             _ => {}
@@ -1007,18 +1007,18 @@ impl App {
         };
         
         if !self.confirm_dialog(&format!("Restore {} snapshot?", snapshot_type)) {
-            self.set_status("Operation cancelled", 30);
+            self.set_status("Restore cancelled", 30);
             return;
         }
         
-        self.set_status("Processing...", 30);
+        self.set_status("Restoring snapshot...", 30);
         refresh();
         
         if self.restore_snapshot(snapshot, snapshot_type) {
-            self.reboot_needed = true;  // Set reboot flag per TUTTI i restore
-            self.set_status(&format!("{} snapshot restored! Press H to reboot when ready", snapshot_type), 30);
+            self.reboot_needed = true;
+            self.set_status(&format!("{} snapshot restored! Press H to reboot when ready", snapshot_type), 150);
         } else {
-            self.set_status("Processing...", 30);
+            self.set_status(&format!("Error: {} snapshot restore failed (rolled back)", snapshot_type), 150);
         }
     }
     
@@ -1042,9 +1042,9 @@ impl App {
             }
             115 | 83 => {  // 's' or 'S'
                 if self.save_config() {
-                    self.set_status("Operation cancelled", 30);
+                    self.set_status("Configuration saved", 50);
                 } else {
-                    self.set_status("Operation cancelled", 30);
+                    self.set_status("Error: failed to save configuration", 100);
                 }
             }
             27 => {  // ESC
@@ -1074,7 +1074,6 @@ impl App {
                 refresh();
                 
                 curs_set(CURSOR_VISIBILITY::CURSOR_VISIBLE);
-                echo();
                 
                 let mut input = String::new();
                 let mut ch = getch();
@@ -1093,7 +1092,6 @@ impl App {
                     ch = getch();
                 }
                 
-                noecho();
                 curs_set(CURSOR_VISIBILITY::CURSOR_INVISIBLE);
                 
                 if ch != 27 && !input.trim().is_empty() {
@@ -1105,7 +1103,7 @@ impl App {
                     self.save_config();
                     self.set_status(&format!("Updated {}", field_name), 50);
                 } else {
-                    self.set_status("Operation cancelled", 30);
+                    self.set_status("Edit cancelled", 30);
                 }
             }
             2 | 3 | 4 => {  // Boolean settings
@@ -1116,24 +1114,14 @@ impl App {
     }
     
     fn toggle_setting(&mut self) {
-        match self.selected_row {
-            2 => {
-                self.config.auto_cleanup = !self.config.auto_cleanup;
-                self.save_config();
-                self.set_status("Operation cancelled", 30);
-            }
-            3 => {
-                self.config.confirm_actions = !self.config.confirm_actions;
-                self.save_config();
-                self.set_status("Operation cancelled", 30);
-            }
-            4 => {
-                self.config.show_timestamps = !self.config.show_timestamps;
-                self.save_config();
-                self.set_status("Operation cancelled", 30);
-            }
-            _ => {}
-        }
+        let (name, toggled) = match self.selected_row {
+            2 => { self.config.auto_cleanup = !self.config.auto_cleanup; ("Auto cleanup", self.config.auto_cleanup) }
+            3 => { self.config.confirm_actions = !self.config.confirm_actions; ("Confirm actions", self.config.confirm_actions) }
+            4 => { self.config.show_timestamps = !self.config.show_timestamps; ("Show timestamps", self.config.show_timestamps) }
+            _ => return,
+        };
+        self.save_config();
+        self.set_status(&format!("{}: {}", name, if toggled { "Yes" } else { "No" }), 50);
     }
     
     fn run(&mut self) {

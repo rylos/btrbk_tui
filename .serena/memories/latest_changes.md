@@ -1,44 +1,24 @@
-# Latest Changes - BTRBK Restore Tool v2.2
+# Latest Changes - BTRBK TUI v2.6
 
-## Session Summary (2025-09-16)
+## v2.6 - Audit Bug Fixes (2026-04-12)
 
-### 🔧 Major Bug Fixes Completed:
-1. **Timestamp Parsing Bug** - Fixed support for both `YYYYMMDDTHHMMSS` and `YYYYMMDD_HHMMSS` formats
-2. **.BROKEN Conflicts Bug** - Added unique timestamps to prevent conflicts (`@.BROKEN.20250916_112530`)
-3. **Hardcoded Restore Logic** - Made restore function fully dynamic for all subvolume types
-4. **Purge Function Bug** - Dynamic detection instead of hardcoded @, @home, @games
-5. **Rust Merge Conflicts** - Resolved all merge conflict markers that prevented compilation
+### Bug Critici Risolti (Rust + Python)
+1. **`verify_restore_success` catch-all `_ => return false`**: Qualsiasi tipo diverso da root/home/games causava rollback. Ora il catch-all verifica solo leggibilità directory → supporta @work, @custom, @var, ecc.
+2. **Messaggi status sbagliati**: 21 occorrenze di "Operation cancelled" e "Processing..." usati nel contesto sbagliato. Ora ogni operazione ha il suo messaggio specifico (refresh, purge, clean, restore, toggle, save, ecc.)
+3. **`edit_setting` echo()**: Causava doppia visualizzazione caratteri. Rimosso echo()/noecho(), la gestione manuale con mvaddstr è sufficiente.
+4. **Escape sequence cleanup incompleto**: `replace('\x1b', "")` rimuoveva solo il byte ESC, non l'intera sequenza ANSI. Ora parser completo che salta ESC[...m.
+5. **Restore fallito mostra "Processing..."**: Ora mostra "Error: {type} snapshot restore failed (rolled back)".
 
-### 🆕 New Features Added:
-- **"B: Clean BROKEN" Command**: 
-  - Scans `/mnt/btr_pool` for all `.BROKEN.*` subvolumes
-  - Deletes them using `btrfs subvolume delete`
-  - Available in both Rust and Python TUI versions
-  - Provides detailed feedback on deletion count
+### Bug Python-specifici Risolti
+6. **`set_status(100, 30)` e `set_status(150, 30)`**: Passavano numeri come messaggio stringa. Tutti sostituiti con messaggi corretti.
+7. **`handle_snapshot_selection` struttura if/else rotta**: C'era un `else` dopo un `else` (errore di indentazione). Fixata struttura.
+8. **Mancava `verify_restore_success` + rollback**: Python non aveva verifica post-restore né rollback. Aggiunto `_verify_restore_success()` a SnapshotManager con stessa logica Rust.
 
-### 🎨 UI Improvements:
-- Changed "P: Purge" to "P: Purge OLD" for better clarity
-- Distinguishes between old snapshots cleanup vs .BROKEN cleanup
+### Allineamento Versioni
+- Tutte e tre le versioni ora a v2.6
+- Python TUI e Rust hanno stessa logica di restore: mv → snapshot → verify → rollback se fallisce
+- Messaggi status identici tra Python e Rust
 
-### 📝 Documentation Updates:
-- Updated README.md to v2.2 with all bug fixes documented
-- Added comprehensive bug analysis in RUST_BUGS_ANALYSIS.md
-- Updated project memories with current status
-
-### ✅ Verification Status:
-- **Python CLI**: ✅ Compiles and works with all fixes
-- **Python TUI**: ✅ Compiles and works with all fixes + new B command
-- **Rust TUI**: ✅ Compiles and works with all fixes + new B command
-
-### 🚀 Git History:
-- `v2.2: Fix critical bugs` - Main bug fixes commit
-- `Fix merge conflicts in Rust version` - Compilation fix
-- `Add B: Clean BROKEN command` - New feature
-- `Change P command label to 'Purge OLD'` - UI clarity
-
-### 🎯 Current State:
-All three versions (Python CLI, Python TUI, Rust TUI) are now:
-- ✅ Bug-free and production ready
-- ✅ Fully dynamic (supports any @prefix configuration)
-- ✅ Feature-complete with consistent interfaces
-- ✅ Properly documented and committed to GitHub
+## Versioni Precedenti
+- v2.5: Interfaccia adattiva, colonne dinamiche, rinomina file
+- v2.2: Fix timestamp, .BROKEN conflicts, comando B, logica dinamica

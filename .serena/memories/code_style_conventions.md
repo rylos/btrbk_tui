@@ -1,32 +1,25 @@
-# Code Style and Conventions
+# Code Style - BTRBK TUI v2.5
 
-## Python Style
-- **Shebang**: `#!/usr/bin/env python3` (TUI Pro) o `#!/usr/bin/python` (CLI)
-- **Type Hints**: Utilizzati nella versione TUI Pro (`from typing import Dict, List, Optional, Tuple`)
-- **Docstrings**: Stile semplice con descrizione funzione
-- **Naming**: snake_case per funzioni e variabili
-- **Classes**: PascalCase (Config, SnapshotManager, TUIApp)
-- **Constants**: UPPER_CASE (CONFIG_FILE, DEFAULT_CONFIG)
+## Python CLI (`btrbk_tui.py`)
+- Shebang: `#!/usr/bin/python`
+- No classi, solo funzioni e variabili globali
+- Naming: `snake_case`
+- Imports: `os`, `subprocess`, `datetime`
 
-## Code Organization
-- **Imports**: Standard library prima, poi third-party
-- **Configuration**: Costanti globali all'inizio
-- **Classes**: Organizzate logicamente (Config, SnapshotManager, TUIApp)
-- **Error Handling**: Try-catch con fallback ai valori di default
+## Python TUI Pro (`btrbk_tui_pro.py`)
+- Shebang: `#!/usr/bin/env python3`
+- Docstring modulo in testa
+- Naming: `snake_case` funzioni/variabili, `PascalCase` classi, `UPPER_CASE` costanti
+- Type hints: `Dict, List, Optional, Tuple` da `typing`
+- Classi: `Config`, `SnapshotManager`, `TUIApp`
+- Costanti: `CONFIG_FILE` (Path), `DEFAULT_CONFIG` (dict)
+- Imports: stdlib prima, nessuna dipendenza esterna (curses è stdlib)
+- Error handling: try/except con fallback silenzioso
 
-## Rust Style
-- **Edition**: 2024 (Cargo.toml)
-- **Dependencies**: ncurses, serde, serde_json, chrono, dirs, libc
-- **Naming**: snake_case per funzioni, PascalCase per struct
-
-## File Structure
-```
-btrbk_tui/
-├── btrbk_restore.py              # CLI version
-├── btrbk_restore_tui_pro.py      # TUI Pro Python
-├── btrbk_tui_rust/               # Rust TUI version
-│   ├── Cargo.toml
-│   └── src/main.rs
-├── README.md
-└── snapshot-restore.desktop
-```
+## Rust (`btrbk_tui_rust/src/main.rs`)
+- Edition 2024
+- Naming: `snake_case` funzioni, `PascalCase` struct
+- Struct: `Config` (Serialize/Deserialize/Clone), `App`
+- Error handling: `Result<T, E>`, `if let Ok(...)`, match con fallback
+- Helper globali: `run_command()`, `get_max_yx()`
+- Nessun `unwrap()` non gestito su operazioni critiche

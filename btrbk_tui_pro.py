@@ -131,7 +131,7 @@ class SnapshotManager:
             return snapshot
     
     def restore_snapshot(self, snapshot: str, snapshot_type: str) -> bool:
-        """Restore a snapshot."""
+        """Restore a snapshot with verification and rollback."""
         btr_pool_dir = self.config.get("btr_pool_dir")
         snapshots_dir = self.config.get("snapshots_dir")
         
@@ -144,7 +144,6 @@ class SnapshotManager:
             subvol_name = f"@{snapshot_type}"
         
         current_subvol = os.path.join(btr_pool_dir, subvol_name)
-        # Generate unique .BROKEN name with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         broken_subvol = os.path.join(btr_pool_dir, f"{subvol_name}.BROKEN.{timestamp}")
         new_subvol = os.path.join(btr_pool_dir, subvol_name)
@@ -155,17 +154,63 @@ class SnapshotManager:
                          check=True, capture_output=True, text=True)
             
             # Create new snapshot
-            subprocess.run(["btrfs", "subvolume", "snapshot", source_path, new_subvol], 
-                         check=True, capture_output=True, text=True)
+            try:
+                subprocess.run(["btrfs", "subvolume", "snapshot", source_path, new_subvol], 
+                             check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError:
+                # Rollback: restore original
+                subprocess.run(["mv", broken_subvol, current_subvol], capture_output=True)
+                return False
+            
+            # Verify restore success
+            if not self._verify_restore_success(new_subvol, snapshot_type):
+                # Rollback: delete failed subvol, restore original
+                subprocess.run(["btrfs", "subvolume", "delete", new_subvol], capture_output=True)
+                subprocess.run(["mv", broken_subvol, current_subvol], capture_output=True)
+                return False
             
             # Auto cleanup if enabled
             if self.config.get("auto_cleanup", False):
                 subprocess.run(["btrfs", "subvolume", "delete", broken_subvol], 
-                             check=True, capture_output=True, text=True)
+                             capture_output=True)
             
             return True
         except subprocess.CalledProcessError:
             return False
+
+    def _verify_restore_success(self, restored_subvol: str, snapshot_type: str) -> bool:
+        """Verify restored subvolume integrity."""
+        if not os.path.exists(restored_subvol):
+            return False
+        
+        # Verify it's a valid btrfs subvolume
+        result = subprocess.run(["btrfs", "subvolume", "show", restored_subvol],
+                              capture_output=True)
+        if result.returncode != 0:
+            return False
+        
+        if snapshot_type == "root":
+            for d in ["etc", "usr", "var", "bin"]:
+                if not os.path.exists(os.path.join(restored_subvol, d)):
+                    return False
+            for f in ["etc/fstab", "etc/passwd"]:
+                p = os.path.join(restored_subvol, f)
+                if not os.path.isfile(p):
+                    return False
+        elif snapshot_type == "home":
+            try:
+                if not os.listdir(restored_subvol):
+                    return False
+            except OSError:
+                return False
+        else:
+            # Any other type: just verify readable
+            try:
+                os.listdir(restored_subvol)
+            except OSError:
+                return False
+        
+        return True
 
     def purge_old_snapshots(self) -> Tuple[int, List[str]]:
         """Purge old snapshots, keeping only the most recent per type."""
@@ -287,7 +332,7 @@ class TUIApp:
         height, width = stdscr.getmaxyx()
         
         # Title bar
-        title = "BTRBK TUI v2.5"
+        title = "BTRBK TUI v2.6"
         try:
             stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
             stdscr.addstr(0, 0, title.center(width)[:width-1])
@@ -797,45 +842,42 @@ class TUIApp:
             else:
                 self.set_status("No reboot needed")
         elif key in [ord('p'), ord('P')]:
-            # Purge old snapshots
             if self.confirm_dialog(stdscr, "Purge old snapshots (keep only most recent)?"):
-                self.set_status(100, 30)
+                self.set_status("Purging old snapshots...", 30)
                 stdscr.refresh()
                 
                 deleted_count, deleted_list = self.purge_old_snapshots()
                 
                 if deleted_count == -1:
-                    self.set_status(100, 30)
+                    self.set_status("Error: cannot read snapshots directory", 100)
                 elif deleted_count == 0:
-                    self.set_status(100, 30)
+                    self.set_status("No old snapshots to purge", 50)
                 else:
-                    self.set_status(150, 30)
+                    self.set_status(f"Purged {deleted_count} old snapshots successfully", 150)
             else:
                 self.set_status("Purge cancelled")
         elif key in [ord('b'), ord('B')]:
-            # Clean all .BROKEN subvolumes
             if self.confirm_dialog(stdscr, "Delete all .BROKEN subvolumes?"):
-                self.set_status(100, 30)
+                self.set_status("Cleaning .BROKEN subvolumes...", 30)
                 stdscr.refresh()
                 
                 deleted_count, deleted_list = self.clean_broken_subvolumes()
                 
                 if deleted_count == -1:
-                    self.set_status(100, 30)
+                    self.set_status("Error: cannot read pool directory", 100)
                 elif deleted_count == 0:
-                    self.set_status(100, 30)
+                    self.set_status("No .BROKEN subvolumes found", 50)
                 else:
-                    self.set_status(150, 30)
+                    self.set_status(f"Cleaned {deleted_count} .BROKEN subvolumes successfully", 150)
             else:
-                self.set_status("Cleanup cancelled")
+                self.set_status("Clean cancelled")
         elif key in [ord('i'), ord('I')]:
-            # Create new snapshots
             if self.confirm_dialog(stdscr, "Create new snapshots with btrbk?"):
                 success, message = self.create_snapshot(stdscr)
                 if success:
-                    self.set_status(150, 30)
+                    self.set_status("Snapshots created successfully", 100)
                 else:
-                    self.set_status(150, 30)
+                    self.set_status(f"Snapshot creation failed: {message}", 150)
             else:
                 self.set_status("Snapshot creation cancelled")
     
@@ -869,21 +911,10 @@ class TUIApp:
         stdscr.refresh()
         
         if self.snapshot_manager.restore_snapshot(snapshot, snapshot_type):
-            self.reboot_needed = True  # Set reboot flag
-            self.set_status("Snapshot restored! Press H to reboot or continue working", 30)
-            
-            # Ask for immediate reboot
-            if self.confirm_dialog(stdscr, "Reboot system now?"):
-                subprocess.run(["reboot"], capture_output=True)
+            self.reboot_needed = True
+            self.set_status(f"{snapshot_type} snapshot restored! Press H to reboot when ready", 150)
         else:
-            self.set_status("Failed to restore snapshot!", 30)
-            self.set_status(200, 30)
-            
-            # Ask for immediate reboot
-            if self.confirm_dialog(stdscr, "Reboot system now?"):
-                subprocess.run(["reboot"], capture_output=True)
-        else:
-            self.set_status(100, 30)
+            self.set_status(f"Error: {snapshot_type} snapshot restore failed (rolled back)", 150)
     
     def handle_settings_input(self, stdscr, key):
         """Handle input for settings screen."""
