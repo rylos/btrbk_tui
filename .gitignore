@@ -28,3 +28,8 @@ Thumbs.db
 # Test files
 /tmp/
 test_*
+
+# Kiro
+.kiro/*
+!.kiro/settings/
+.directory

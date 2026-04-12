@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "serena": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/oraios/serena", "serena", "start-mcp-server"],
+      "env": {
+        "SERENA_WORKSPACE": "/home/marco/dev/btrbk_tui"
+      }
+    }
+  }
+}
