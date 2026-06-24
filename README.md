@@ -16,6 +16,20 @@ This project provides tools to easily restore Btrfs subvolume snapshots created 
 - System reboot with visual indicators
 - Optionally reboot the system after restoration
 
+## ✨ Features v2.6 - Audit Hardening
+
+### 🛡️ **Safe Restore (all three versions):**
+- **Verified rollback**: every rollback command (`mv` / `btrfs delete`) return code is checked. Three distinct outcomes are reported: success, *failed* (rollback succeeded, previous state restored) and *rollback failed* (inconsistent state → `.BROKEN` kept and a CRITICAL message points to it for manual recovery)
+- **Source pre-check**: the source snapshot existence is verified **before** touching the current subvolume
+- **Subvolume guard**: `btrfs subvolume show` is run before the destructive `mv`, preventing a plain directory from being moved by mistake
+- **CLI brought to parity**: `btrbk_tui.py` now performs the same verify + rollback as the TUI versions, reads the shared config, requires root and runs `sync` before reboot
+
+### 🐛 **Robustness fixes:**
+- **Rust UTF-8 safety**: all string truncation is char-aware (`truncate_str`), eliminating panics on multibyte characters in snapshot names or btrbk output
+- **Snapshot cache**: the snapshots directory is no longer re-read on every frame; the cache is invalidated only on refresh/restore/purge/clean/create. The `R` key now actually refreshes
+- **Cleaner output**: the snapshot-creation output area is fully redrawn (no scroll glitches), and dead/unreachable code was removed
+- **Zero linter warnings**: `cargo clippy` (Rust) and `ruff check` (Python) both pass clean
+
 ## ✨ Features v2.5 - Bug Fixes & Improvements
 
 ### 🔄 **Automatic Detection:**
@@ -85,7 +99,7 @@ python3 (with curses module included)
 
 ### For Rust version:
 ```bash
-# Rust installation (edition 2021)
+# Rust installation (edition 2024)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Build the project
@@ -149,7 +163,7 @@ sudo ./target/release/btrbk_tui
 - **Complete settings screen**: Same editing functionality as Python version
 - **Efficient memory management**: Ideal for resource-limited systems
 - **Total compatibility**: Zero functional differences with Python Pro version
-- **Optimized compilation**: Rust edition 2021, zero errors and warnings
+- **Optimized compilation**: Rust edition 2024, zero errors and warnings
 - **Snapshot creation**: Multi-threaded interface for real-time output
 - **Purge and reboot**: All advanced features implemented
 
@@ -226,6 +240,8 @@ Includes `btrbk-tui.desktop` for desktop environment integration.
 ### Implemented Security Measures:
 - **Mandatory confirmations**: Confirmation dialogs for all critical operations
 - **Automatic backup**: Existing subvolumes are renamed to .BROKEN before restoration
+- **Source pre-check & subvolume guard**: the source snapshot must exist and the current subvolume must be a valid btrfs subvolume before any destructive operation
+- **Verified rollback**: on failure the original subvolume is restored and the rollback outcome is checked; if the rollback itself fails, the `.BROKEN` backup is kept and a CRITICAL message indicates manual recovery is needed
 - **Error handling**: Robust operations with fallback and clear error messages
 - **Optional auto-cleanup**: Configurable automatic cleanup of .BROKEN files
 
@@ -325,7 +341,7 @@ btrbk_tui/
 ├── btrbk_tui.py                  # Simple CLI version
 ├── btrbk_tui_pro.py              # Python professional TUI version
 ├── btrbk_tui_rust/           # Rust professional TUI version
-│   ├── Cargo.toml               # Rust configuration (edition 2021)
+│   ├── Cargo.toml               # Rust configuration (edition 2024)
 │   ├── src/main.rs              # Rust source code
 │   └── target/release/          # Compiled binary
 ├── btrbk-tui.desktop             # Desktop file for DE integration
@@ -336,12 +352,16 @@ btrbk_tui/
 
 ### **Languages used:**
 - **Python 3**: CLI and TUI Pro versions
-- **Rust 2021**: High-performance TUI version
+- **Rust 2024**: High-performance TUI version
 - **JSON**: Shared configuration
 
 ### **Dependencies:**
 - **Python**: `curses`, `json`, `pathlib`, `subprocess`, `os` modules
 - **Rust**: `ncurses`, `serde`, `serde_json`, `chrono`, `dirs`, `libc`
+
+### **Linting:**
+- **Python**: [`ruff`](https://docs.astral.sh/ruff/) — `ruff check btrbk_tui.py btrbk_tui_pro.py`
+- **Rust**: `cargo clippy` — both pass with zero warnings
 
 ### **Testing:**
 - Tested on Arch Linux with KDE Plasma 6

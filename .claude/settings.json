@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '(.tool_input.file_path // .tool_response.filePath) // empty'); case \"$f\" in *.py) out=$(ruff check \"$f\" 2>&1) || { echo \"ruff check ha rilevato problemi in $f:\" >&2; echo \"$out\" >&2; exit 2; } ;; esac",
+            "statusMessage": "ruff check..."
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -43,7 +43,7 @@ class Config:
                     for key, value in saved_config.items():
                         if key in DEFAULT_CONFIG:  # Only load known keys
                             self.data[key] = value
-        except Exception as e:
+        except Exception:
             # If loading fails, use defaults
             pass
     
@@ -54,7 +54,7 @@ class Config:
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(self.data, f, indent=2)
             return True
-        except Exception as e:
+        except Exception:
             return False
     
     def get(self, key: str, default=None):
@@ -127,56 +127,79 @@ class SnapshotManager:
                 return snapshot
         except (ValueError, IndexError):
             return snapshot
-        except ValueError:
-            return snapshot
     
-    def restore_snapshot(self, snapshot: str, snapshot_type: str) -> bool:
-        """Restore a snapshot with verification and rollback."""
+    def restore_snapshot(self, snapshot: str, snapshot_type: str) -> str:
+        """Restore a snapshot with verification and rollback.
+
+        Returns:
+            "success"         - restore completato e verificato
+            "failed"          - restore fallito ma rollback riuscito (stato precedente ripristinato)
+            "rollback_failed" - restore fallito E rollback fallito (stato incoerente, .BROKEN conservato)
+        """
         btr_pool_dir = self.config.get("btr_pool_dir")
         snapshots_dir = self.config.get("snapshots_dir")
-        
+
         source_path = os.path.join(snapshots_dir, snapshot)
-        
+
+        # Pre-check: lo snapshot sorgente deve esistere prima di toccare il subvolume corrente
+        if not os.path.exists(source_path):
+            return "failed"
+
         # Dynamic subvolume path generation
         if snapshot_type == "root" or snapshot_type == "":
             subvol_name = "@"
         else:
             subvol_name = f"@{snapshot_type}"
-        
+
         current_subvol = os.path.join(btr_pool_dir, subvol_name)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         broken_subvol = os.path.join(btr_pool_dir, f"{subvol_name}.BROKEN.{timestamp}")
-        new_subvol = os.path.join(btr_pool_dir, subvol_name)
-        
-        try:
+        new_subvol = current_subvol
+
+        current_existed = os.path.exists(current_subvol)
+
+        # Guardia: se il subvolume corrente esiste, deve essere un vero subvolume btrfs
+        # prima di spostarlo (evita di spostare una directory normale per errore)
+        if current_existed:
+            show = subprocess.run(["btrfs", "subvolume", "show", current_subvol],
+                                  capture_output=True)
+            if show.returncode != 0:
+                return "failed"
+
             # Move current subvolume to .BROKEN
-            subprocess.run(["mv", current_subvol, broken_subvol], 
-                         check=True, capture_output=True, text=True)
-            
-            # Create new snapshot
-            try:
-                subprocess.run(["btrfs", "subvolume", "snapshot", source_path, new_subvol], 
-                             check=True, capture_output=True, text=True)
-            except subprocess.CalledProcessError:
-                # Rollback: restore original
-                subprocess.run(["mv", broken_subvol, current_subvol], capture_output=True)
-                return False
-            
-            # Verify restore success
-            if not self._verify_restore_success(new_subvol, snapshot_type):
-                # Rollback: delete failed subvol, restore original
-                subprocess.run(["btrfs", "subvolume", "delete", new_subvol], capture_output=True)
-                subprocess.run(["mv", broken_subvol, current_subvol], capture_output=True)
-                return False
-            
-            # Auto cleanup if enabled
-            if self.config.get("auto_cleanup", False):
-                subprocess.run(["btrfs", "subvolume", "delete", broken_subvol], 
-                             capture_output=True)
-            
-            return True
-        except subprocess.CalledProcessError:
-            return False
+            mv = subprocess.run(["mv", current_subvol, broken_subvol], capture_output=True)
+            if mv.returncode != 0:
+                return "failed"
+
+        # Create new snapshot
+        snap = subprocess.run(["btrfs", "subvolume", "snapshot", source_path, new_subvol],
+                              capture_output=True)
+        if snap.returncode != 0:
+            # Rollback: restore original
+            if current_existed:
+                rb = subprocess.run(["mv", broken_subvol, current_subvol], capture_output=True)
+                if rb.returncode != 0:
+                    return "rollback_failed"
+            return "failed"
+
+        # Verify restore success
+        if not self._verify_restore_success(new_subvol, snapshot_type):
+            # Rollback: delete failed subvol, restore original
+            dele = subprocess.run(["btrfs", "subvolume", "delete", new_subvol], capture_output=True)
+            if dele.returncode != 0:
+                # Il subvolume fallito occupa ancora il path: impossibile ripristinare l'originale
+                return "rollback_failed"
+            if current_existed:
+                rb = subprocess.run(["mv", broken_subvol, current_subvol], capture_output=True)
+                if rb.returncode != 0:
+                    return "rollback_failed"
+            return "failed"
+
+        # Auto cleanup if enabled (solo se avevamo un originale da rimuovere)
+        if self.config.get("auto_cleanup", False) and current_existed:
+            subprocess.run(["btrfs", "subvolume", "delete", broken_subvol], capture_output=True)
+
+        return "success"
 
     def _verify_restore_success(self, restored_subvol: str, snapshot_type: str) -> bool:
         """Verify restored subvolume integrity."""
@@ -313,7 +336,20 @@ class TUIApp:
         self.status_message = ""
         self.status_timeout = 0
         self.reboot_needed = False  # Track if reboot is needed
-    
+        # Cache degli snapshot: evita di rileggere il filesystem ad ogni frame.
+        # None = cache invalidata (verrà ricalcolata al prossimo accesso).
+        self._snapshot_cache: Optional[Tuple[Dict[str, List[str]], List[str]]] = None
+
+    def get_snapshots_cached(self) -> Tuple[Dict[str, List[str]], List[str]]:
+        """Restituisce gli snapshot dalla cache, ricalcolandoli solo se invalidata."""
+        if self._snapshot_cache is None:
+            self._snapshot_cache = self.snapshot_manager.get_snapshots()
+        return self._snapshot_cache
+
+    def invalidate_snapshots(self):
+        """Invalida la cache: il prossimo accesso rileggerà il filesystem."""
+        self._snapshot_cache = None
+
     def init_colors(self):
         """Initialize color pairs."""
         curses.start_color()
@@ -524,57 +560,6 @@ class TUIApp:
         finally:
             # Restore normal input mode
             stdscr.nodelay(False)
-        
-        try:
-            # Get all snapshot directories
-            all_snapshots = []
-            for item in os.listdir(snapshots_dir):
-                item_path = os.path.join(snapshots_dir, item)
-                if os.path.isdir(item_path) and (
-                    item.startswith("@.") or 
-                    item.startswith("@home.") or 
-                    item.startswith("@games.")
-                ):
-                    all_snapshots.append(item_path)
-            
-            if not all_snapshots:
-                return 0, []
-            
-            # Sort snapshots
-            all_snapshots.sort()
-            
-            # Group by type and find old snapshots to delete
-            to_delete = []
-            
-            def process_type(prefix):
-                type_snapshots = [s for s in all_snapshots if os.path.basename(s).startswith(prefix + ".")]
-                if len(type_snapshots) > 1:
-                    # Keep the last (most recent) one, delete the rest
-                    to_delete.extend(type_snapshots[:-1])
-            
-            process_type("@")
-            process_type("@home")
-            process_type("@games")
-            
-            if not to_delete:
-                return 0, []
-            
-            # Delete old snapshots
-            deleted_count = 0
-            for snapshot_path in to_delete:
-                try:
-                    result = subprocess.run(
-                        ["btrfs", "subvolume", "delete", snapshot_path],
-                        capture_output=True, text=True, check=True
-                    )
-                    deleted_count += 1
-                except subprocess.CalledProcessError:
-                    pass  # Continue with other snapshots even if one fails
-            
-            return deleted_count, [os.path.basename(s) for s in to_delete]
-            
-        except Exception:
-            return -1, []  # Error occurred
 
     def purge_old_snapshots(self) -> Tuple[int, List[str]]:
         """Purge old snapshots using SnapshotManager."""
@@ -587,9 +572,9 @@ class TUIApp:
     def draw_main_screen(self, stdscr):
         """Draw main snapshot selection screen with dynamic columns."""
         height, width = stdscr.getmaxyx()
-        
-        snapshot_groups, sorted_prefixes = self.snapshot_manager.get_snapshots()
-        
+
+        snapshot_groups, sorted_prefixes = self.get_snapshots_cached()
+
         if not snapshot_groups:
             try:
                 stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
@@ -750,12 +735,18 @@ class TUIApp:
             try:
                 new_value = edit_win.getstr(3, 7, dialog_width - 10).decode('utf-8')
                 if new_value.strip():
-                    self.config.set(key, new_value.strip())
+                    cleaned = new_value.strip()
+                    self.config.set(key, cleaned)
                     self.config.save()  # Auto-save after change
-                    self.set_status(f"Updated {key}")
+                    self.invalidate_snapshots()
+                    # Avvisa se un path di directory non esiste
+                    if key in ("btr_pool_dir", "snapshots_dir") and not os.path.isdir(cleaned):
+                        self.set_status(f"Updated {key} (WARNING: path does not exist)")
+                    else:
+                        self.set_status(f"Updated {key}")
                 else:
                     self.set_status("No changes made")
-            except:
+            except Exception:
                 self.set_status("Edit cancelled")
             
             curses.noecho()
@@ -796,8 +787,8 @@ class TUIApp:
     
     def handle_main_input(self, stdscr, key):
         """Handle input for main screen with dynamic columns."""
-        snapshot_groups, sorted_prefixes = self.snapshot_manager.get_snapshots()
-        
+        snapshot_groups, sorted_prefixes = self.get_snapshots_cached()
+
         if not sorted_prefixes:
             return
         
@@ -830,12 +821,14 @@ class TUIApp:
             self.current_screen = "settings"
             self.selected_row = 0
         elif key in [ord('r'), ord('R')]:
-            # Always refresh
+            # Invalidate cache and force re-read from filesystem
+            self.invalidate_snapshots()
             self.set_status("Refreshed snapshot list")
         elif key in [ord('h'), ord('H')]:
             # Reboot if needed
             if self.reboot_needed:
                 if self.confirm_dialog(stdscr, "Reboot system now?"):
+                    subprocess.run(["sync"], capture_output=True)
                     subprocess.run(["reboot"], capture_output=True)
                 else:
                     self.set_status("Reboot cancelled")
@@ -847,7 +840,8 @@ class TUIApp:
                 stdscr.refresh()
                 
                 deleted_count, deleted_list = self.purge_old_snapshots()
-                
+                self.invalidate_snapshots()
+
                 if deleted_count == -1:
                     self.set_status("Error: cannot read snapshots directory", 100)
                 elif deleted_count == 0:
@@ -862,7 +856,8 @@ class TUIApp:
                 stdscr.refresh()
                 
                 deleted_count, deleted_list = self.clean_broken_subvolumes()
-                
+                self.invalidate_snapshots()
+
                 if deleted_count == -1:
                     self.set_status("Error: cannot read pool directory", 100)
                 elif deleted_count == 0:
@@ -875,6 +870,7 @@ class TUIApp:
             if self.confirm_dialog(stdscr, "Create new snapshots with btrbk?"):
                 success, message = self.create_snapshot(stdscr)
                 if success:
+                    self.invalidate_snapshots()
                     self.set_status("Snapshots created successfully", 100)
                 else:
                     self.set_status(f"Snapshot creation failed: {message}", 150)
@@ -910,9 +906,14 @@ class TUIApp:
         self.set_status("Restoring snapshot...", 30)
         stdscr.refresh()
         
-        if self.snapshot_manager.restore_snapshot(snapshot, snapshot_type):
+        result = self.snapshot_manager.restore_snapshot(snapshot, snapshot_type)
+        if result == "success":
             self.reboot_needed = True
+            self.invalidate_snapshots()
             self.set_status(f"{snapshot_type} snapshot restored! Press H to reboot when ready", 150)
+        elif result == "rollback_failed":
+            self.invalidate_snapshots()
+            self.set_status(f"CRITICAL: {snapshot_type} restore AND rollback failed - manual recovery needed (.BROKEN kept)", 300)
         else:
             self.set_status(f"Error: {snapshot_type} snapshot restore failed (rolled back)", 150)
     

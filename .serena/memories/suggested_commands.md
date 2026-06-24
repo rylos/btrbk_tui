@@ -15,11 +15,21 @@ cargo build --release
 # symlink: /usr/local/bin/btrbk_tui -> target/release/btrbk_tui
 ```
 
-## Verifica Sintassi Python
+## Lint / Verifica
 ```bash
-python3 -m py_compile btrbk_tui.py
-python3 -m py_compile btrbk_tui_pro.py
+# Python (ruff installato via pacman)
+python3 -m py_compile btrbk_tui.py btrbk_tui_pro.py
+ruff check btrbk_tui.py btrbk_tui_pro.py
+ruff check --fix btrbk_tui.py btrbk_tui_pro.py
+ruff format btrbk_tui.py btrbk_tui_pro.py
+
+# Rust
+cd btrbk_tui_rust && cargo clippy --release        # zero warning attualmente
+cargo clippy --fix --release --allow-dirty         # applica fix automatici
 ```
+
+NOTA: un hook Claude Code (.claude/settings.json) esegue automaticamente `ruff check`
+dopo ogni Edit/Write/MultiEdit su file .py e reinietta gli errori all'agente.
 
 ## Sistema
 ```bash
