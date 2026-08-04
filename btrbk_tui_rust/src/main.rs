@@ -1399,12 +1399,12 @@ mod tests {
         let conf = "\
 transaction_log            /var/log/btrbk.log
 volume /mnt/btr_pool
-  target ssh://192.168.1.1:2222/volume2/backup/PC-Marco-btrfs
+  target ssh://10.0.0.1:2222/mnt/backup/host-btrfs
   subvolume @
 ";
         assert_eq!(
             parse_target_url(conf).as_deref(),
-            Some("ssh://192.168.1.1:2222/volume2/backup/PC-Marco-btrfs")
+            Some("ssh://10.0.0.1:2222/mnt/backup/host-btrfs")
         );
         assert_eq!(parse_target_url("volume /mnt/btr_pool\n  subvolume @\n"), None);
     }
@@ -1413,8 +1413,8 @@ volume /mnt/btr_pool
     fn received_uuids_skip_unset_ones() {
         // real `btrfs subvolume list -u -R` output, plus a row with no received_uuid
         let output = "\
-ID 33457 gen 27329461 top level 257 parent_uuid 40306c4a-a7f6-b443-a247-da3f59bfc1ca received_uuid c9e62952-9e79-e041-acde-4dc9e3323826 uuid 931a0611-0769-404a-9a79-fddbcc070729 path backup/PC-Marco-btrfs/@games.20260803T0000
-ID 33426 gen 27325696 top level 257 parent_uuid cef19314-dc70-4f4b-931d-8a470cf020b6 received_uuid 17951594-5a9d-5a43-a860-c0de8011da35 uuid 1c8dd660-a0fd-af4c-ad18-6b46f007b6ff path backup/PC-Marco-btrfs/@games.20260802T1212
+ID 33457 gen 27329461 top level 257 parent_uuid 40306c4a-a7f6-b443-a247-da3f59bfc1ca received_uuid c9e62952-9e79-e041-acde-4dc9e3323826 uuid 931a0611-0769-404a-9a79-fddbcc070729 path backup/host-btrfs/@games.20260803T0000
+ID 33426 gen 27325696 top level 257 parent_uuid cef19314-dc70-4f4b-931d-8a470cf020b6 received_uuid 17951594-5a9d-5a43-a860-c0de8011da35 uuid 1c8dd660-a0fd-af4c-ad18-6b46f007b6ff path backup/host-btrfs/@games.20260802T1212
 ID 257 gen 1 top level 5 parent_uuid - received_uuid - uuid 0ed5ab3d-732e-4544-8522-10abc449a27b path backup
 ";
         let uuids = parse_received_uuids(output);
