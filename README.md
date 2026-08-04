@@ -25,6 +25,12 @@ This project provides tools to easily restore Btrfs subvolume snapshots created 
 - **UI feedback**: the status bar announces the target check before the ssh call blocks the interface
 - **Unit tests** (Rust) cover the parsing of `btrbk.conf`, of `received_uuid` lists and of `btrfs subvolume show` — including the trap where `Parent UUID:` is matched instead of `UUID:`
 
+### 🧹 **Lint rules pinned in the repository:**
+- **`.ruff.toml` added**: the project had no ruff configuration, so the effective rule set was whatever the installed ruff defaulted to. The "zero linter warnings" claim of v2.6 quietly expired as ruff was upgraded — 51 warnings had accumulated by v2.7
+- **Explicit rule selection** (correctness, modernisation, bugbear, bandit, pylint) with every waiver documented inline: `subprocess.run` without `check=` is deliberate where return codes drive the rollback logic, broad `except Exception` keeps a fullscreen curses app from dying, naive datetimes match btrbk's own local-time snapshot names
+- **166 findings fixed**: modern type annotations (`dict`/`list` over `typing`), `sys.exit()` over the `site` builtin `exit()`, `.values()` iteration, `contextlib.suppress`, unused unpacked variables
+- `ruff check` and `cargo clippy` both pass clean, and now stay that way across tool upgrades
+
 ## ✨ Features v2.6 - Audit Hardening
 
 ### 🛡️ **Safe Restore (all three versions):**

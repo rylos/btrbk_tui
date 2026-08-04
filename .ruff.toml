@@ -1,0 +1,62 @@
+# Linting rules for the Python versions of btrbk-tui.
+#
+# Pinned explicitly on purpose: ruff's default rule set changes between
+# releases, so a project without this file silently accumulates warnings as
+# ruff is upgraded. That is exactly what happened before v2.7, when the README
+# still claimed a clean run.
+
+target-version = "py39"
+
+[lint]
+# Correctness, modernisation and the security/bug families that matter for a
+# tool running as root on a filesystem. Deliberately not "ALL": the purely
+# stylistic families would mean rewriting the project for no benefit.
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # import sorting
+    "UP",       # pyupgrade
+    "B",        # bugbear
+    "C4",       # comprehensions
+    "SIM",      # simplifications
+    "RET",      # return statements
+    "PL",       # pylint
+    "RUF",      # ruff-specific
+    "S",        # bandit
+    "DTZ",      # naive datetimes
+    "EXE",      # shebang / executable bit
+]
+
+ignore = [
+    # --- deliberate design choices -----------------------------------------
+
+    # subprocess.run() without explicit check=. Return codes are inspected by
+    # hand throughout the restore path: check=True would raise exactly where
+    # the rollback logic needs to inspect the failure and undo its own work.
+    "PLW1510",
+
+    # Blind "except Exception". This is a fullscreen curses application: an
+    # unhandled exception leaves the terminal unusable, so broad catches with
+    # a safe fallback are preferred to a clean traceback.
+    "BLE001",
+
+    # try/except/pass. Used for optional operations (loading a config that may
+    # not exist yet) where falling back to defaults is the intended behaviour.
+    "S110",
+
+    # Naive datetimes. Snapshot timestamps are btrbk's own local-time names
+    # (@home.20260804T2113); attaching a timezone would misrepresent them.
+    "DTZ005",
+    "DTZ007",
+
+    # Module-level globals rebound by load_config(). The CLI version is a flat
+    # script whose directories are module state, shared with the TUI config
+    # file; threading them through every function would buy nothing.
+    "PLW0603",
+
+    # --- not worth churning the codebase over -------------------------------
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915",  # branch/argument/statement counts
+    "PLR2004", # magic values, mostly curses key codes and colour pairs
+    "S603", "S607",  # subprocess with a partial executable path (btrfs, mv, ssh)
+    "E501",    # line length
+]
