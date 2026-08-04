@@ -11,10 +11,13 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # Configuration file path
 CONFIG_FILE = Path.home() / ".config" / "btrbk_tui" / "config.json"
+
+# btrbk configuration, read to discover the backup target
+BTRBK_CONF = "/etc/btrbk/btrbk.conf"
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -235,10 +238,85 @@ class SnapshotManager:
         
         return True
 
+    def _get_target_url(self) -> Optional[str]:
+        """First ssh:// target declared in btrbk.conf, if any."""
+        try:
+            with open(BTRBK_CONF, 'r') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0] == "target" and parts[1].startswith("ssh://"):
+                        return parts[1]
+        except OSError:
+            pass
+        return None
+
+    def get_target_received_uuids(self) -> Optional[Set[str]]:
+        """received_uuid of every subvolume present on the backup target.
+
+        Returns None when the target is not configured or not reachable. The
+        caller must then refuse to purge: without knowing what the target
+        holds, there is no way to tell which snapshot is still needed as
+        parent for the next incremental send.
+        """
+        target = self._get_target_url()
+        if not target:
+            return None
+
+        rest = target[len("ssh://"):]
+        hostport, _, path = rest.partition('/')
+        host, _, port = hostport.partition(':')
+
+        try:
+            result = subprocess.run(
+                ["ssh", "-p", port or "22",
+                 "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host,
+                 f"sudo btrfs subvolume list -u -R '/{path}'"],
+                capture_output=True, text=True, timeout=60, check=True)
+        except (subprocess.SubprocessError, OSError):
+            return None
+
+        uuids = set()
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if "received_uuid" in parts:
+                idx = parts.index("received_uuid")
+                if idx + 1 < len(parts) and parts[idx + 1] != "-":
+                    uuids.add(parts[idx + 1])
+        return uuids
+
+    def get_local_uuid(self, snapshot_path: str) -> Optional[str]:
+        """UUID of a local subvolume, or None if it cannot be read."""
+        try:
+            result = subprocess.run(["btrfs", "subvolume", "show", snapshot_path],
+                                    capture_output=True, text=True, check=True)
+        except (subprocess.SubprocessError, OSError):
+            return None
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            # plain "UUID:" only — "Parent UUID:" and "Received UUID:" must not match
+            if stripped.startswith("UUID:"):
+                fields = stripped.split()
+                if len(fields) >= 2:
+                    return fields[1]
+        return None
+
     def purge_old_snapshots(self) -> Tuple[int, List[str]]:
-        """Purge old snapshots, keeping only the most recent per type."""
+        """Purge old snapshots, keeping the ones still needed by the target.
+
+        btrbk does not protect snapshots that serve as parent for incremental
+        backups (see btrbk.conf(5)), so deleting the newest snapshot the target
+        also holds forces the next run into a full send — for a large subvolume
+        that means hours of transfer. We therefore keep the newest snapshot
+        present on the target *and* everything after it.
+
+        Returns (-2, []) when the target cannot be queried, (-1, []) on error.
+        """
         snapshots_dir = self.config.get("snapshots_dir")
-        
+
+        target_uuids = self.get_target_received_uuids()
+        if target_uuids is None:
+            return -2, []
+
         try:
             all_snapshots = []
             for item in os.listdir(snapshots_dir):
@@ -264,12 +342,27 @@ class SnapshotManager:
             # Find old snapshots to delete for each prefix
             to_delete = []
             for prefix in prefixes:
-                type_snapshots = [s for s in all_snapshots 
+                type_snapshots = [s for s in all_snapshots
                                 if os.path.basename(s).startswith(f"{prefix}.")]
-                
-                if len(type_snapshots) > 1:
-                    # Keep the last (most recent) one, delete the rest
-                    to_delete.extend(type_snapshots[:-1])
+
+                if len(type_snapshots) <= 1:
+                    continue
+
+                # newest local snapshot the target also holds: it is the parent
+                # for the next incremental send and must survive, together with
+                # everything newer than it
+                keep_from = -1
+                for index, snapshot_path in enumerate(type_snapshots):
+                    uuid = self.get_local_uuid(snapshot_path)
+                    if uuid and uuid in target_uuids:
+                        keep_from = index
+
+                if keep_from < 0:
+                    # nothing in common with the target: the chain is already
+                    # broken, deleting more would only force a bigger full send
+                    continue
+
+                to_delete.extend(type_snapshots[:keep_from])
             
             if not to_delete:
                 return 0, []
@@ -368,7 +461,7 @@ class TUIApp:
         height, width = stdscr.getmaxyx()
         
         # Title bar
-        title = "BTRBK TUI v2.6"
+        title = "BTRBK TUI v2.7"
         try:
             stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
             stdscr.addstr(0, 0, title.center(width)[:width-1])
@@ -835,14 +928,17 @@ class TUIApp:
             else:
                 self.set_status("No reboot needed")
         elif key in [ord('p'), ord('P')]:
-            if self.confirm_dialog(stdscr, "Purge old snapshots (keep only most recent)?"):
-                self.set_status("Purging old snapshots...", 30)
+            if self.confirm_dialog(stdscr, "Purge old snapshots (keeps what the backup target still needs)?"):
+                # querying the target over ssh takes a moment: say so before blocking
+                self.set_status("Checking backup target, then purging...", 30)
                 stdscr.refresh()
-                
+
                 deleted_count, deleted_list = self.purge_old_snapshots()
                 self.invalidate_snapshots()
 
-                if deleted_count == -1:
+                if deleted_count == -2:
+                    self.set_status("Backup target unreachable: nothing purged (chain left intact)", 150)
+                elif deleted_count == -1:
                     self.set_status("Error: cannot read snapshots directory", 100)
                 elif deleted_count == 0:
                     self.set_status("No old snapshots to purge", 50)

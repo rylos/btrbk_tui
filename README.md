@@ -16,6 +16,15 @@ This project provides tools to easily restore Btrfs subvolume snapshots created 
 - System reboot with visual indicators
 - Optionally reboot the system after restoration
 
+## ✨ Features v2.7 - Chain-Aware Purge
+
+### 🔗 **Purge no longer breaks incremental backups (Python + Rust):**
+- **Root cause**: the purge kept only the most recent snapshot per type, deleting the one the backup target still needed as parent. btrbk does not protect parent snapshots itself (`btrbk.conf(5)`), so the next run had no common parent and fell back to a **full send** — on a ~900 GiB subvolume, over an hour of transfer
+- **Fix**: the target is queried over ssh (`btrfs subvolume list -u -R`) and each local snapshot's `UUID` is matched against the target's `received_uuid`. The newest snapshot present on both survives, together with everything newer
+- **Fails safe**: if the target is unreachable, or shares no snapshot with the local pool, **nothing is deleted** and the UI says so — a broken chain is never made worse
+- **UI feedback**: the status bar announces the target check before the ssh call blocks the interface
+- **Unit tests** (Rust) cover the parsing of `btrbk.conf`, of `received_uuid` lists and of `btrfs subvolume show` — including the trap where `Parent UUID:` is matched instead of `UUID:`
+
 ## ✨ Features v2.6 - Audit Hardening
 
 ### 🛡️ **Safe Restore (all three versions):**
@@ -191,7 +200,7 @@ The tool automatically handles snapshots with this nomenclature:
 - **S**: Access settings screen
 - **R**: Refresh snapshot list
 - **I**: Create new snapshots (btrbk run --progress)
-- **P**: Purge old snapshots (keeps only most recent per type)
+- **P**: Purge old snapshots (keeps what the backup target still needs)
 - **H**: System reboot (when needed)
 - **Q**: Exit application
 
@@ -215,12 +224,20 @@ The tool automatically handles snapshots with this nomenclature:
 
 #### Smart Purge (P Key):
 - **Analyzes** all snapshots by type (@, @home, @games)
-- **Keeps** only the most recent snapshot per type
-- **Deletes** all older snapshots automatically
+- **Chain-aware**: queries the backup target and keeps the newest snapshot the target also holds, plus everything newer. That snapshot is the parent for the next incremental send — deleting it forces a full send on the next run
+- **Deletes** only the snapshots older than that parent
+- **Refuses to purge** when the target is unreachable, or when no snapshot is shared with it: without that information there is no safe way to tell what can go
 - **Confirmation** before operation for safety
 - **Detailed feedback** on how many snapshots were deleted
 - **Error handling**: Continues operation even if individual deletions fail
-- **Space optimization**: Automatically frees disk space while maintaining essential backups
+- **Space optimization**: Frees disk space without ever breaking the incremental chain
+
+> **Why this matters:** btrbk does not protect snapshots that are still needed as
+> parents for incremental backups (see `btrbk.conf(5)`). A purge that keeps only
+> the most recent snapshot per type will silently break the chain whenever the
+> target is behind — for example after a backup run was interrupted. The next run
+> then has no common parent and falls back to a full send, which on a large
+> subvolume means hours of transfer.
 
 #### Smart Reboot:
 - **R Key**: Always available for snapshot list refresh

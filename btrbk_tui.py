@@ -223,7 +223,7 @@ def main():
         print("❌ Errore: questo strumento richiede privilegi di root. Esegui con sudo.")
         exit(1)
 
-    print("🔄 BTRBK TUI v2.6 - Versione CLI Dinamica")
+    print("🔄 BTRBK TUI v2.7 - Versione CLI Dinamica")
     print("=" * 50)
 
     # Carica la configurazione condivisa con le versioni TUI

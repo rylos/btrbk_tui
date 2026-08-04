@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use chrono::{Local, NaiveDateTime};
 
+/// btrbk configuration, read to discover the backup target
+const BTRBK_CONF: &str = "/etc/btrbk/btrbk.conf";
+
 #[derive(Serialize, Deserialize, Clone)]
 struct Config {
     btr_pool_dir: String,
@@ -418,9 +421,23 @@ impl App {
         }
     }
     
+    /// Purge old snapshots, keeping the ones still needed by the backup target.
+    ///
+    /// btrbk does not protect snapshots that serve as parent for incremental
+    /// backups (see btrbk.conf(5)), so deleting the newest snapshot the target
+    /// also holds forces the next run into a full send — for a large subvolume
+    /// that means hours of transfer. We therefore keep the newest snapshot
+    /// present on the target *and* everything after it.
+    ///
+    /// Returns (-2, []) when the target cannot be queried, (-1, []) on error.
     fn purge_old_snapshots(&self) -> (i32, Vec<String>) {
         let snapshots_dir = &self.config.snapshots_dir;
-        
+
+        let target_uuids = match target_received_uuids() {
+            Some(uuids) => uuids,
+            None => return (-2, Vec::new()),
+        };
+
         match fs::read_dir(snapshots_dir) {
             Ok(entries) => {
                 let mut all_snapshots: Vec<String> = entries
@@ -457,12 +474,29 @@ impl App {
                             basename.starts_with(&format!("{}.", prefix))
                         })
                         .collect();
-                    
-                    if type_snapshots.len() > 1 {
-                        // Keep the last (most recent) one, delete the rest
-                        for snapshot in &type_snapshots[..type_snapshots.len() - 1] {
-                            to_delete.push((*snapshot).clone());
+
+                    if type_snapshots.len() <= 1 {
+                        return;
+                    }
+
+                    // newest local snapshot the target also holds: it is the
+                    // parent for the next incremental send and must survive,
+                    // together with everything newer than it
+                    let mut keep_from: Option<usize> = None;
+                    for (index, snapshot) in type_snapshots.iter().enumerate() {
+                        if let Some(uuid) = local_subvolume_uuid(snapshot)
+                            && target_uuids.contains(&uuid)
+                        {
+                            keep_from = Some(index);
                         }
+                    }
+
+                    // nothing in common with the target: the chain is already
+                    // broken, deleting more would only force a bigger full send
+                    let Some(keep_from) = keep_from else { return };
+
+                    for snapshot in &type_snapshots[..keep_from] {
+                        to_delete.push((*snapshot).clone());
                     }
                 };
                 
@@ -957,14 +991,17 @@ impl App {
                 }
             }
             112 | 80 => {  // 'p' or 'P'
-                if self.confirm_dialog("Purge old snapshots (keep only most recent)?") {
-                    self.set_status("Purging old snapshots...", 30);
+                if self.confirm_dialog("Purge old snapshots (keeps what the backup target still needs)?") {
+                    // querying the target over ssh takes a moment: say so before blocking
+                    self.set_status("Checking backup target, then purging...", 30);
                     refresh();
-                    
+
                     let (deleted_count, _deleted_list) = self.purge_old_snapshots();
                     self.invalidate_snapshots();
 
-                    if deleted_count == -1 {
+                    if deleted_count == -2 {
+                        self.set_status("Backup target unreachable: nothing purged (chain left intact)", 150);
+                    } else if deleted_count == -1 {
                         self.set_status("Error: cannot read snapshots directory", 100);
                     } else if deleted_count == 0 {
                         self.set_status("No old snapshots to purge", 50);
@@ -1227,6 +1264,93 @@ fn render_output_area(lines: &[String], start_y: i32, height: i32, width: i32) {
     }
 }
 
+/// First ssh:// target declared in a btrbk configuration.
+fn parse_target_url(conf: &str) -> Option<String> {
+    conf.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("target"), Some(url)) if url.starts_with("ssh://") => Some(url.to_string()),
+                _ => None,
+            }
+        })
+        .next()
+}
+
+/// received_uuid values in the output of `btrfs subvolume list -u -R`.
+fn parse_received_uuids(output: &str) -> std::collections::HashSet<String> {
+    let mut uuids = std::collections::HashSet::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if let Some(index) = fields.iter().position(|f| *f == "received_uuid")
+            && let Some(uuid) = fields.get(index + 1)
+            && *uuid != "-"
+        {
+            uuids.insert((*uuid).to_string());
+        }
+    }
+    uuids
+}
+
+/// UUID in the output of `btrfs subvolume show`.
+fn parse_subvolume_uuid(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        // plain "UUID:" only — "Parent UUID:" and "Received UUID:" must not match
+        line.trim()
+            .strip_prefix("UUID:")
+            .map(|value| value.trim().to_string())
+    })
+}
+
+/// First ssh:// target declared in btrbk.conf, if any.
+fn btrbk_target_url() -> Option<String> {
+    parse_target_url(&fs::read_to_string(BTRBK_CONF).ok()?)
+}
+
+/// received_uuid of every subvolume present on the backup target.
+///
+/// Returns None when the target is not configured or not reachable: the caller
+/// must then refuse to purge, since it cannot tell which snapshot is still
+/// needed as parent for the next incremental send.
+fn target_received_uuids() -> Option<std::collections::HashSet<String>> {
+    let target = btrbk_target_url()?;
+    let rest = target.strip_prefix("ssh://")?;
+    let (hostport, path) = rest.split_once('/')?;
+    let (host, port) = match hostport.split_once(':') {
+        Some((h, p)) => (h, p),
+        None => (hostport, "22"),
+    };
+
+    let output = Command::new("ssh")
+        .args([
+            "-p", port,
+            "-o", "ConnectTimeout=10",
+            "-o", "BatchMode=yes",
+            host,
+            &format!("sudo btrfs subvolume list -u -R '/{}'", path),
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(parse_received_uuids(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// UUID of a local subvolume, or None if it cannot be read.
+fn local_subvolume_uuid(path: &str) -> Option<String> {
+    let output = Command::new("btrfs")
+        .args(["subvolume", "show", path])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_subvolume_uuid(&String::from_utf8_lossy(&output.stdout))
+}
+
 fn run_command(cmd: &[&str]) -> bool {
     Command::new(cmd[0])
         .args(&cmd[1..])
@@ -1261,7 +1385,58 @@ fn main() {
     // Create and run the TUI app
     let mut app = App::new();
     app.run();
-    
+
     // Cleanup
     endwin();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_url_is_the_first_ssh_target() {
+        let conf = "\
+transaction_log            /var/log/btrbk.log
+volume /mnt/btr_pool
+  target ssh://192.168.1.1:2222/volume2/backup/PC-Marco-btrfs
+  subvolume @
+";
+        assert_eq!(
+            parse_target_url(conf).as_deref(),
+            Some("ssh://192.168.1.1:2222/volume2/backup/PC-Marco-btrfs")
+        );
+        assert_eq!(parse_target_url("volume /mnt/btr_pool\n  subvolume @\n"), None);
+    }
+
+    #[test]
+    fn received_uuids_skip_unset_ones() {
+        // real `btrfs subvolume list -u -R` output, plus a row with no received_uuid
+        let output = "\
+ID 33457 gen 27329461 top level 257 parent_uuid 40306c4a-a7f6-b443-a247-da3f59bfc1ca received_uuid c9e62952-9e79-e041-acde-4dc9e3323826 uuid 931a0611-0769-404a-9a79-fddbcc070729 path backup/PC-Marco-btrfs/@games.20260803T0000
+ID 33426 gen 27325696 top level 257 parent_uuid cef19314-dc70-4f4b-931d-8a470cf020b6 received_uuid 17951594-5a9d-5a43-a860-c0de8011da35 uuid 1c8dd660-a0fd-af4c-ad18-6b46f007b6ff path backup/PC-Marco-btrfs/@games.20260802T1212
+ID 257 gen 1 top level 5 parent_uuid - received_uuid - uuid 0ed5ab3d-732e-4544-8522-10abc449a27b path backup
+";
+        let uuids = parse_received_uuids(output);
+        assert_eq!(uuids.len(), 2);
+        assert!(uuids.contains("c9e62952-9e79-e041-acde-4dc9e3323826"));
+        assert!(uuids.contains("17951594-5a9d-5a43-a860-c0de8011da35"));
+    }
+
+    #[test]
+    fn subvolume_uuid_ignores_parent_and_received() {
+        // "Parent UUID" comes first in real output: a sloppy match would return it
+        let output = "\
+/mnt/btr_pool/btrbk_snapshots/@games.20260803T0000
+\tName: \t\t\t@games.20260803T0000
+\tUUID: \t\t\tc9e62952-9e79-e041-acde-4dc9e3323826
+\tParent UUID: \t\tf914faf4-aae8-484b-90d4-dae5b2d6088a
+\tReceived UUID: \t\t-
+";
+        assert_eq!(
+            parse_subvolume_uuid(output).as_deref(),
+            Some("c9e62952-9e79-e041-acde-4dc9e3323826")
+        );
+        assert_eq!(parse_subvolume_uuid("no uuid here\n"), None);
+    }
 }
