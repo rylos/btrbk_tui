@@ -1,1 +1,14 @@
-/home/marco/.local/share/applications/snapshot-restore.desktop
+[Desktop Entry]
+Type=Application
+Name=btrbk TUI
+Name[it]=btrbk TUI
+Comment=Restore Btrfs snapshots created with btrbk
+Comment[it]=Ripristina snapshot Btrfs creati con btrbk
+Icon=backup-symbolic
+# The TUI needs root to create, delete and restore subvolumes.
+# pkexec asks for the password through the desktop's polkit agent.
+Exec=pkexec /usr/local/bin/btrbk_tui
+Terminal=true
+StartupNotify=true
+Categories=System;
+Keywords=btrfs;btrbk;snapshot;backup;restore;

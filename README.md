@@ -254,7 +254,15 @@ The tool automatically handles snapshots with this nomenclature:
 
 ## Desktop File
 
-Includes `btrbk-tui.desktop` for desktop environment integration.
+`btrbk-tui.desktop` launches the Rust TUI through `pkexec`, so the desktop's
+polkit agent asks for the password instead of the tool failing on a missing
+root. It expects the binary at `/usr/local/bin/btrbk_tui`; adjust `Exec=` if you
+installed it elsewhere.
+
+```bash
+install -Dm644 btrbk-tui.desktop ~/.local/share/applications/btrbk-tui.desktop
+update-desktop-database ~/.local/share/applications
+```
 
 ## Security
 
