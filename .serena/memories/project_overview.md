@@ -1,4 +1,4 @@
-# BTRBK TUI v2.6 - Project Overview
+# BTRBK TUI v2.7 - Project Overview
 
 ## Scopo
 Set completo di strumenti per il ripristino di snapshot Btrfs creati con btrbk. Tre implementazioni con interfacce diverse, configurazione condivisa e parità di funzionalità.
@@ -25,5 +25,8 @@ Set completo di strumenti per il ripristino di snapshot Btrfs creati con btrbk. 
 - Restore sicuro: mv → snapshot → verify → rollback se fallisce
 - Backup `.BROKEN.TIMESTAMP` unici
 - Messaggi status specifici per ogni operazione
+- Purge chain-aware (v2.7, solo TUI Python e Rust): interroga il target ssh di btrbk e non cancella mai il parent snapshot del prossimo send incrementale; fail-safe se il target è irraggiungibile (vedi `mem:latest_changes`)
+- Desktop entry `btrbk-tui.desktop` (pkexec sulla TUI Rust)
+- Repo pubblico su GitHub: niente dati reali di rete/host nel codice o nei test
 
-### Stato: Tutte le versioni ✅ Produzione v2.6
+### Stato: Tutte le versioni ✅ Produzione v2.7 (2026-08-04)

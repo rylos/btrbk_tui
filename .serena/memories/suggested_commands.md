@@ -1,4 +1,4 @@
-# Comandi Suggeriti - BTRBK TUI v2.6
+# Comandi Suggeriti - BTRBK TUI v2.7
 
 ## Esecuzione
 ```bash
@@ -26,6 +26,16 @@ ruff format btrbk_tui.py btrbk_tui_pro.py
 # Rust
 cd btrbk_tui_rust && cargo clippy --release        # zero warning attualmente
 cargo clippy --fix --release --allow-dirty         # applica fix automatici
+cargo test                                         # unit test parsing (purge chain-aware)
+```
+
+Le regole ruff sono fissate in `.ruff.toml` (il risultato non dipende più dalla versione di ruff installata).
+
+## Desktop entry
+```bash
+desktop-file-validate btrbk-tui.desktop
+install -Dm644 btrbk-tui.desktop ~/.local/share/applications/btrbk-tui.desktop
+update-desktop-database ~/.local/share/applications
 ```
 
 NOTA: un hook Claude Code (.claude/settings.json) esegue automaticamente `ruff check`

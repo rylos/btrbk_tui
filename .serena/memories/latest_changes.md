@@ -1,49 +1,36 @@
-# Latest Changes - BTRBK TUI v2.6
+# Latest Changes - BTRBK TUI v2.7
 
-## v2.6 - Audit Hardening (2026-06-24)
+## v2.7 - Chain-aware purge (2026-08-04, commit 31e4d8f)
 
-Audit completo delle 3 versioni + fix di tutti i problemi trovati. Tutto compila pulito (py_compile OK, cargo build --release OK, cargo clippy ZERO warning).
+### Problema
+La purge teneva solo lo snapshot più recente per tipo e cancellava quello che il target di backup usava come **parent** per il prossimo send incrementale. btrbk NON protegge i parent (btrbk.conf(5)) -> il run successivo non trova parent comune e ricade su full send (~900 GiB, oltre un'ora). È così che la catena locale si è rotta il 2026-08-04.
 
-### Restore robusto (Rust + Python TUI + CLI)
-- **Rollback verificato**: ora si controlla il returncode di OGNI comando di rollback (mv/btrfs delete). Prima erano ignorati -> potevano lasciare il sistema senza `@` mostrando "rolled back" falsamente.
-- **3 esiti distinti**: success / failed (rollback OK) / rollback_failed (stato incoerente, .BROKEN conservato, messaggio CRITICAL timeout 300 / exit 1 nella CLI).
-  - Rust: enum `RestoreOutcome { Success, Failed, RollbackFailed }`
-  - Python TUI: `restore_snapshot` ritorna stringa "success"|"failed"|"rollback_failed"
-  - CLI: messaggi CRITICO con path .BROKEN per recupero manuale
-- **Pre-check sorgente**: si verifica esistenza source prima di distruggere il subvolume corrente.
-- **Guardia subvolume**: prima del mv distruttivo si verifica `btrfs subvolume show current` (evita di spostare una dir normale).
-- **current_existed**: gestito il caso in cui il subvolume corrente non esiste (no mv, no cleanup .BROKEN inutile).
+### Soluzione (btrbk_tui_pro.py + Rust; la CLI non ha purge, non toccata)
+- Si legge il target da `/etc/btrbk/btrbk.conf` (costante `BTRBK_CONF`): primo target ssh.
+- Si interroga il target via ssh: `btrfs subvolume list -u -R` -> insieme dei `received_uuid`.
+- Per ogni snapshot locale si legge l'UUID (`btrfs subvolume show`) e lo si confronta con i received_uuid del target.
+- Sopravvive lo snapshot più recente presente su entrambi + tutto ciò che è più nuovo; si cancella solo ciò che lo precede.
+- **Fail-safe**: target irraggiungibile o nessuno snapshot in comune -> NON si cancella nulla e la UI lo segnala (una catena già rotta non viene peggiorata).
+- La status bar annuncia il controllo del target prima che la chiamata ssh blocchi l'interfaccia.
+- Rust: helper di parsing come funzioni pure (`parse_target_url`, `parse_received_uuids`, `parse_subvolume_uuid`) + wrapper I/O (`btrbk_target_url`, `target_received_uuids`, `local_subvolume_uuid`).
+- Python: `SnapshotManager._get_target_url`, `get_target_received_uuids`, `get_local_uuid`.
+- **Trappola nota**: un match approssimativo su `btrfs subvolume show` restituisce "Parent UUID:" invece di "UUID:" (coperta da test).
 
-### CLI portata in parità (btrbk_tui.py)
-- Aggiunto `verify_restore_success()` + rollback completo (prima era solo mv->snapshot, regressione di sicurezza).
-- Aggiunto `load_config()`: legge ~/.config/btrbk_tui/config.json (prima ignorava la config condivisa).
-- Aggiunto root check (os.geteuid()).
-- sync prima di reboot.
+### Test automatici (novità)
+- `btrbk_tui_rust/src/main.rs` ha `mod tests` con 3 unit test: `target_url_is_the_first_ssh_target`, `received_uuids_skip_unset_ones`, `subvolume_uuid_ignores_parent_and_received`. Si eseguono con `cargo test`.
+- Commit 3ebb5c4: i campioni nei test usano host/path/UUID **placeholder** (il repo è pubblico: mai IP LAN, path NAS o UUID reali nei test o nel codice).
 
-### Rust-specifici
-- **Slicing UTF-8 -> panic**: helper `truncate_str(s, max_chars)` (usa chars().take()) sostituisce TUTTI i &s[..n] per byte (~15 occorrenze in draw_*/create_snapshot/confirm_dialog). Prima un carattere multibyte sul punto di taglio causava panic senza endwin().
-- Centraggio completion_msg con .chars().count() (i simboli check/cross sono 3 byte).
-- `render_output_area()` helper: ridisegna l'intera area output (fix glitch scroll + dedup dei 2 blocchi identici).
-- unwrap() su stdout/stderr -> match con early return.
-- Type alias `SnapshotData = (HashMap<String, Vec<String>>, Vec<String>)`.
+### Lint ruff fissato nel repo (commit 653c054)
+- Senza config, il set di regole dipendeva dalla versione di ruff installata: 51 warning accumulati solo per upgrade del tool.
+- `.ruff.toml` fissa la selezione: E, W, F, I, UP, B, C4, SIM, RET, PL, RUF, S, DTZ, EXE (target py39).
+- Deroghe documentate inline: PLW1510 (returncode controllati a mano nel percorso restore/rollback), BLE001 (catch ampi per non lasciare il terminale curses inutilizzabile), S110, DTZ005/DTZ007 (nomi snapshot btrbk in ora locale), PLW0603.
+- 166 finding corretti senza cambi di comportamento: generics builtin al posto di `typing`, `sys.exit()`, `.values()`, `contextlib.suppress`, variabili spacchettate inutilizzate.
 
-### Cache snapshot (Rust + Python TUI)
-- Prima get_snapshots() (read_dir) veniva chiamato ad ogni frame (~100ms) + ad ogni tasto.
-- Ora cache invalidata solo su: R (refresh), restore, purge, clean, create, edit path.
-  - Rust: campo snapshots_cache: Option<SnapshotData>, snapshots_cached()/invalidate_snapshots(), draw_main_screen ora &mut self.
-  - Python: _snapshot_cache, get_snapshots_cached()/invalidate_snapshots().
-- Tasto R ora invalida davvero la cache (prima era solo cosmetico).
-
-### Pulizia
-- Python: rimosso codice morto in create_snapshot (vecchia purge hardcoded @/@home/@games dopo try/finally, irraggiungibile).
-- Python: rimosso except ValueError duplicato in format_snapshot_name; bare except: -> except Exception:.
-- Validazione path in edit settings (Rust + Python): avvisa "WARNING: path does not exist" se la dir non esiste.
-
-### Warning clippy (tutti risolti - ZERO residui)
-- 20 fix automatici via `cargo clippy --fix` (let-chains edition 2024, or_default, if collassabili, next_back al posto di Iterator::last, array al posto di vec!, ecc.).
-- 4 manuali: `map_while(Result::ok)` al posto di lines().flatten() nei thread stdout/stderr (no loop-forever), strip_prefix('@') al posto di &s[1..], type alias SnapshotData per "very complex type".
+### Desktop entry (commit d952dc5)
+- `btrbk-tui.desktop` era un symlink rotto verso la home dell'autore; ora è un file reale: `Exec=pkexec /usr/local/bin/btrbk_tui`, `Terminal=true`. Passa `desktop-file-validate`. Installazione documentata nel README (`install -Dm644 ... ~/.local/share/applications/`).
 
 ## Versioni Precedenti
+- v2.6 (2026-06-24): audit hardening - rollback verificato con 3 esiti (success/failed/rollback_failed), pre-check sorgente, guardia `btrfs subvolume show`, CLI in parità (verify+rollback, config condivisa, root check, sync), `truncate_str` UTF-8 safe, `render_output_area`, cache snapshot (invalidata su R/restore/purge/clean/create/edit path), zero warning clippy, hook ruff
 - v2.6 (2026-04-12): fix catch-all verify, messaggi status, parser ANSI, parità verify Python/Rust
 - v2.5: Interfaccia adattiva, colonne dinamiche, rinomina file
 - v2.2: Fix timestamp, .BROKEN conflicts, comando B, logica dinamica
