@@ -1,4 +1,4 @@
-# BTRBK TUI v2.7 - Project Overview
+# BTRBK TUI v2.8 - Project Overview
 
 ## Scopo
 Set completo di strumenti per il ripristino di snapshot Btrfs creati con btrbk. Tre implementazioni con interfacce diverse, configurazione condivisa e parità di funzionalità.
@@ -29,4 +29,7 @@ Set completo di strumenti per il ripristino di snapshot Btrfs creati con btrbk. 
 - Desktop entry `btrbk-tui.desktop` (pkexec sulla TUI Rust)
 - Repo pubblico su GitHub: niente dati reali di rete/host nel codice o nei test
 
-### Stato: Tutte le versioni ✅ Produzione v2.7 (2026-08-04)
+- `--purge-plan` (dry run della purge) in entrambe le TUI; Home/End; scroll delle colonne
+- Uso quotidiano: `sudo btrbk_tui` = TUI Rust (symlink /usr/local/bin)
+
+### Stato: Tutte le versioni ✅ Produzione v2.8 (2026-09-21)

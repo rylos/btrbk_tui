@@ -1,4 +1,4 @@
-# Comandi Suggeriti - BTRBK TUI v2.7
+# Comandi Suggeriti - BTRBK TUI v2.8
 
 ## Esecuzione
 ```bash
@@ -22,6 +22,7 @@ python3 -m py_compile btrbk_tui.py btrbk_tui_pro.py
 ruff check btrbk_tui.py btrbk_tui_pro.py
 ruff check --fix btrbk_tui.py btrbk_tui_pro.py
 ruff format btrbk_tui.py btrbk_tui_pro.py
+python3 -m unittest discover -s tests -p '*_test.py'   # test Python
 
 # Rust
 cd btrbk_tui_rust && cargo clippy --release        # zero warning attualmente
@@ -40,6 +41,12 @@ update-desktop-database ~/.local/share/applications
 
 NOTA: un hook Claude Code (.claude/settings.json) esegue automaticamente `ruff check`
 dopo ogni Edit/Write/MultiEdit su file .py e reinietta gli errori all'agente.
+
+## Dry run della purge (sola lettura, interroga il target via ssh)
+```bash
+sudo btrbk_tui --purge-plan
+sudo ./btrbk_tui_pro.py --purge-plan
+```
 
 ## Sistema
 ```bash

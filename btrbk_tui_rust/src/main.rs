@@ -1,14 +1,50 @@
+use chrono::{Local, NaiveDate, NaiveDateTime};
 use ncurses::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use chrono::{Local, NaiveDateTime};
+use std::process::{Command, Stdio};
+use std::rc::Rc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// btrbk configuration, read to discover the backup target
 const BTRBK_CONF: &str = "/etc/btrbk/btrbk.conf";
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const KEY_ESC: i32 = 27;
+const KEY_LF: i32 = 10;
+const KEY_CR: i32 = 13;
+const KEY_SPACE: i32 = 32;
+const KEY_DEL: i32 = 127;
+const KEY_BS: i32 = 8;
+
+// Durata dei messaggi di stato
+const STATUS_SHORT: Duration = Duration::from_secs(3);
+const STATUS_MEDIUM: Duration = Duration::from_secs(5);
+const STATUS_LONG: Duration = Duration::from_secs(10);
+const STATUS_RESULT: Duration = Duration::from_secs(15);
+const STATUS_CRITICAL: Duration = Duration::from_secs(60);
+
+/// Righe di output di btrbk tenute in memoria durante la creazione degli snapshot.
+const MAX_OUTPUT_LINES: usize = 1000;
+
+/// Voci della schermata Settings, nell'ordine in cui sono mostrate.
+const SETTINGS: [&str; 5] = [
+    "BTR Pool Directory",
+    "Snapshots Directory",
+    "Auto Cleanup .BROKEN",
+    "Confirm Actions",
+    "Show Timestamps",
+];
+
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
 struct Config {
     btr_pool_dir: String,
     snapshots_dir: String,
@@ -31,50 +67,82 @@ impl Default for Config {
     }
 }
 
-/// Snapshot raggruppati per prefisso + lista ordinata dei prefissi.
-type SnapshotData = (std::collections::HashMap<String, Vec<String>>, Vec<String>);
+/// Snapshot raggruppati per subvolume ("@" per primo, poi in ordine alfabetico);
+/// dentro ogni gruppo il più recente è in testa.
+type SnapshotGroups = Vec<(String, Vec<String>)>;
 
-/// Esito di un'operazione di restore.
+/// Snapshots of one subvolume, oldest first, each with its UUID (None when it
+/// could not be read).
+type PurgeCandidates = (String, Vec<(String, Option<String>)>);
+
+/// Esito di un'operazione di restore. Le varianti di errore portano il motivo.
 enum RestoreOutcome {
     /// Restore completato e verificato.
     Success,
     /// Restore fallito ma rollback riuscito: il sistema è nello stato precedente.
-    Failed,
+    Failed(String),
     /// Restore fallito E rollback fallito: stato incoerente, intervento manuale necessario.
-    RollbackFailed,
+    RollbackFailed(String),
+}
+
+/// What a purge would delete, computed before touching anything.
+#[derive(Debug, Default, PartialEq)]
+struct PurgePlan {
+    /// Snapshot names to delete, oldest first.
+    delete: Vec<String>,
+    /// Subvolumes left alone because they share no snapshot with the target.
+    skipped: Vec<String>,
+}
+
+/// Where btrbk sends its backups, as far as ssh is concerned.
+#[derive(Debug, PartialEq)]
+struct SshTarget {
+    host: String,
+    port: Option<String>,
+    path: String,
+    user: Option<String>,
+    identity: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Screen {
+    Main,
+    Settings,
 }
 
 struct App {
     config: Config,
     config_path: PathBuf,
-    current_screen: String,
-    selected_row: i32,
-    selected_col: i32,
+    screen: Screen,
+    selected_row: usize,
+    selected_col: usize,
     status_message: String,
-    status_timeout: i32,
-    reboot_needed: bool,  // Track if reboot is needed
+    status_until: Option<Instant>,
+    reboot_needed: bool,
     // Cache degli snapshot: evita di rileggere il filesystem ad ogni frame.
     // None = cache invalidata (verrà ricalcolata al prossimo accesso).
-    snapshots_cache: Option<SnapshotData>,
+    snapshots_cache: Option<Rc<SnapshotGroups>>,
 }
 
 impl App {
     fn new() -> Self {
+        // Mai ripiegare su una directory scrivibile da tutti: questo tool gira
+        // come root e la config decide su quali path agiscono mv e btrfs delete.
         let config_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .unwrap_or_else(|| PathBuf::from("/root"))
             .join(".config")
             .join("btrbk_tui")
             .join("config.json");
-        
+
         let mut app = App {
             config: Config::default(),
             config_path,
-            current_screen: "main".to_string(),
+            screen: Screen::Main,
             selected_row: 0,
             selected_col: 0,
             status_message: String::new(),
-            status_timeout: 0,
-            reboot_needed: false,  // Initialize reboot flag
+            status_until: None,
+            reboot_needed: false,
             snapshots_cache: None,
         };
 
@@ -83,345 +151,240 @@ impl App {
     }
 
     /// Restituisce gli snapshot dalla cache, ricalcolandoli solo se invalidata.
-    fn snapshots_cached(&mut self) -> SnapshotData {
-        if self.snapshots_cache.is_none() {
-            self.snapshots_cache = Some(self.get_snapshots());
+    fn snapshots_cached(&mut self) -> Rc<SnapshotGroups> {
+        if let Some(cached) = &self.snapshots_cache {
+            return Rc::clone(cached);
         }
-        self.snapshots_cache.clone().unwrap()
+        let fresh = Rc::new(self.get_snapshots());
+        self.snapshots_cache = Some(Rc::clone(&fresh));
+        fresh
     }
 
     /// Invalida la cache: il prossimo accesso rileggerà il filesystem.
     fn invalidate_snapshots(&mut self) {
         self.snapshots_cache = None;
     }
-    
+
     fn load_config(&mut self) {
         if let Ok(content) = fs::read_to_string(&self.config_path)
-            && let Ok(saved_config) = serde_json::from_str::<Config>(&content) {
-                self.config = saved_config;
-            }
+            && let Ok(saved_config) = serde_json::from_str::<Config>(&content)
+        {
+            self.config = saved_config;
+        }
     }
-    
+
     fn save_config(&self) -> bool {
         if let Some(parent) = self.config_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        
+
         match serde_json::to_string_pretty(&self.config) {
             Ok(json) => fs::write(&self.config_path, json).is_ok(),
             Err(_) => false,
         }
     }
-    
-    fn get_snapshots(&self) -> SnapshotData {
-        use std::collections::HashMap;
-        
-        let mut snapshot_groups: HashMap<String, Vec<String>> = HashMap::new();
-        
-        match fs::read_dir(&self.config.snapshots_dir) {
-            Ok(entries) => {
-                for entry in entries {
-                    if let Ok(entry) = entry
-                        && entry.path().is_dir() {
-                            let name = entry.file_name().to_string_lossy().into_owned();
-                            if name.starts_with('@') && name.contains('.') {
-                                let prefix = name.split('.').next().unwrap_or("").to_string();
-                                snapshot_groups.entry(prefix).or_default().push(name);
-                            }
-                        }
-                }
-            }
-            Err(_) => return (HashMap::new(), Vec::new()),
-        }
-        
-        // Sort each group by timestamp (newest first)
-        for snapshots in snapshot_groups.values_mut() {
-            snapshots.sort_by(|a, b| b.cmp(a));
-        }
-        
-        // Sort prefixes for consistent ordering (@ first, then alphabetically)
-        let mut sorted_prefixes: Vec<String> = snapshot_groups.keys().cloned().collect();
-        sorted_prefixes.sort_by(|a, b| {
-            if a == "@" && b != "@" {
-                std::cmp::Ordering::Less
-            } else if a != "@" && b == "@" {
-                std::cmp::Ordering::Greater
-            } else {
-                a.cmp(b)
-            }
-        });
-        
-        (snapshot_groups, sorted_prefixes)
+
+    fn get_snapshots(&self) -> SnapshotGroups {
+        let Ok(entries) = fs::read_dir(&self.config.snapshots_dir) else {
+            return Vec::new();
+        };
+        let names = entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned());
+        group_snapshots(names)
     }
-    
+
     fn format_snapshot_name(&self, snapshot: &str) -> String {
-        if !self.config.show_timestamps {
-            return snapshot.to_string();
+        if self.config.show_timestamps
+            && let Some((_, timestamp)) = split_snapshot_name(snapshot)
+            && let Some(dt) = parse_btrbk_timestamp(timestamp)
+        {
+            return format!("{} ({})", snapshot, dt.format("%Y-%m-%d %H:%M:%S"));
         }
-        
-        // Extract timestamp from snapshot name dynamically
-        if snapshot.starts_with('@') && snapshot.contains('.') {
-            let parts: Vec<&str> = snapshot.split('.').collect();
-            if parts.len() >= 2 {
-                let timestamp_str = parts[1];
-                
-                // Try multiple timestamp formats
-                if let Ok(dt) = NaiveDateTime::parse_from_str(timestamp_str, "%Y%m%dT%H%M") {
-                    return format!("{} ({})", snapshot, dt.format("%Y-%m-%d %H:%M:%S"));
-                } else if let Ok(dt) = NaiveDateTime::parse_from_str(timestamp_str, "%Y%m%d_%H%M%S") {
-                    return format!("{} ({})", snapshot, dt.format("%Y-%m-%d %H:%M:%S"));
-                }
-            }
-        }
-        
         snapshot.to_string()
     }
-    
+
     fn init_colors(&self) {
         start_color();
         use_default_colors();
-        
-        init_pair(1, COLOR_BLACK, COLOR_CYAN);    // Selected item
-        init_pair(2, COLOR_RED, -1);              // Headers
-        init_pair(3, COLOR_GREEN, -1);            // Success
-        init_pair(4, COLOR_YELLOW, -1);           // Warning
-        init_pair(5, COLOR_WHITE, COLOR_BLACK);   // Status bar
-        init_pair(6, COLOR_CYAN, -1);             // Info
+
+        init_pair(1, COLOR_BLACK, COLOR_CYAN); // Selected item
+        init_pair(2, COLOR_RED, -1); // Headers
+        init_pair(3, COLOR_GREEN, -1); // Success
+        init_pair(4, COLOR_YELLOW, -1); // Warning
+        init_pair(5, COLOR_WHITE, COLOR_BLACK); // Status bar
+        init_pair(6, COLOR_CYAN, -1); // Info
     }
-    
-    fn set_status(&mut self, message: &str, timeout: i32) {
+
+    fn set_status(&mut self, message: &str, duration: Duration) {
         self.status_message = message.to_string();
-        self.status_timeout = timeout;
+        self.status_until = Some(Instant::now() + duration);
     }
-    
-    fn create_snapshot(&self) -> (bool, String) {
-        use std::process::{Command, Stdio};
-        use std::io::{BufRead, BufReader};
-        
-        let (height, width) = get_max_yx();
-        
-        // Clear screen and show header
-        clear();
+
+    /// Mostra subito un messaggio prima di un'operazione che blocca l'interfaccia.
+    /// `set_status` da solo non basta: il messaggio verrebbe disegnato solo al
+    /// frame successivo, cioè a operazione già conclusa.
+    fn show_busy(&mut self, message: &str) {
+        self.set_status(message, STATUS_SHORT);
+        self.draw_screen();
+        refresh();
+    }
+
+    /// Runs `btrbk run --progress`, streaming its output to the screen.
+    fn create_snapshot(&self) -> Result<(), String> {
+        let (height, _) = get_max_yx();
+
+        erase();
         self.draw_header();
-        
-        // Show operation title
+
         let title = "Creating Snapshots with btrbk...";
         attron(COLOR_PAIR(2) | A_BOLD());
-        mvaddstr(4, (width - title.len() as i32) / 2, title);
+        put_centered(4, title);
         attroff(COLOR_PAIR(2) | A_BOLD());
-        
-        // Show instructions
-        let instruction = "Press ESC to cancel or wait for completion";
+
         attron(A_DIM());
-        mvaddstr(6, (width - instruction.len() as i32) / 2, instruction);
+        put_centered(6, "Press ESC to cancel or wait for completion");
         attroff(A_DIM());
-        
+
         // Simple output area - only horizontal borders
         let output_start_y = 8;
-        let output_height = height - 12;
-        
-        // Draw simple horizontal borders
-        let border = "-".repeat(width as usize);
-        mvaddstr(output_start_y - 1, 0, &border);
-        mvaddstr(output_start_y + output_height, 0, &border);
-        
+        let output_height = (height - 12).max(1);
+        put_separator(output_start_y - 1);
+        put_separator(output_start_y + output_height);
         refresh();
-        
-        // Set non-blocking input
-        timeout(50);
-        
-        match Command::new("btrbk")
+
+        let mut command = Command::new("btrbk");
+        command
             .args(["run", "--progress"])
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())  // Capture stderr too
+            .stderr(Stdio::piped());
+        // Own session: no controlling terminal, so a stray ssh password prompt
+        // fails instead of scribbling over the curses screen, and the whole
+        // process tree (btrfs send, ssh, pv) can be signalled at once on cancel.
+        // SAFETY: setsid() is async-signal-safe and touches no shared state.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let mut process = command
             .spawn()
-        {
-            Ok(mut process) => {
-                let (stdout, stderr) = match (process.stdout.take(), process.stderr.take()) {
-                    (Some(out), Some(err)) => (out, err),
-                    _ => {
-                        let _ = process.kill();
-                        let _ = process.wait();
-                        timeout(100);
-                        return (false, "Failed to capture btrbk output".to_string());
-                    }
-                };
-                
-                // Use threads to read both stdout and stderr
-                use std::sync::mpsc;
-                use std::thread;
-                
-                let (tx, rx) = mpsc::channel();
-                let tx_stderr = tx.clone();
-                
-                // Thread for stdout
-                let stdout_thread = thread::spawn(move || {
-                    let reader = BufReader::new(stdout);
-                    for line_content in reader.lines().map_while(Result::ok) {
-                        let _ = tx.send(line_content);
-                    }
-                });
+            .map_err(|err| format!("cannot run btrbk: {}", err))?;
 
-                // Thread for stderr
-                let stderr_thread = thread::spawn(move || {
-                    let reader = BufReader::new(stderr);
-                    for line_content in reader.lines().map_while(Result::ok) {
-                        let _ = tx_stderr.send(line_content);
-                    }
-                });
-                
-                let mut output_lines: Vec<String> = Vec::new();
+        let (Some(stdout), Some(stderr)) = (process.stdout.take(), process.stderr.take()) else {
+            let _ = process.kill();
+            let _ = process.wait();
+            return Err("failed to capture btrbk output".to_string());
+        };
 
-                // Read from both stdout and stderr
-                loop {
-                    // Check for ESC key
-                    let key = getch();
-                    if key == 27 {  // ESC
-                        // Safely terminate process and threads
-                        let _ = process.kill();
-                        
-                        // Give threads time to finish reading
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        
-                        // Wait for process to actually terminate
-                        let _ = process.wait();
-                        
-                        // Try to join threads with timeout
-                        let _ = stdout_thread.join();
-                        let _ = stderr_thread.join();
-                        
-                        timeout(100);
-                        return (false, "Operation cancelled by user".to_string());
+        // I thread terminano da soli quando le pipe si chiudono
+        let (tx, rx) = mpsc::channel();
+        let tx_stderr = tx.clone();
+        thread::spawn(move || forward_stream(stdout, &tx));
+        thread::spawn(move || forward_stream(stderr, &tx_stderr));
+
+        let group = -(process.id() as libc::pid_t);
+        let mut log = OutputLog::default();
+        let mut cancelled_at: Option<Instant> = None;
+        let mut exited_at: Option<Instant> = None;
+        let mut killed = false;
+
+        timeout(50);
+        loop {
+            if getch() == KEY_ESC && cancelled_at.is_none() {
+                // SIGINT to the whole group is what Ctrl-C does in a shell, the
+                // case btrbk is written for: it aborts and logs the transaction.
+                unsafe { libc::kill(group, libc::SIGINT) };
+                cancelled_at = Some(Instant::now());
+                attron(COLOR_PAIR(4) | A_BOLD());
+                put_centered(height - 2, "Cancelling, waiting for btrbk to stop...");
+                attroff(COLOR_PAIR(4) | A_BOLD());
+                refresh();
+            }
+
+            if let Some(since) = cancelled_at
+                && !killed
+                && since.elapsed() > Duration::from_secs(5)
+            {
+                unsafe { libc::kill(group, libc::SIGKILL) };
+                killed = true;
+            }
+
+            let mut dirty = false;
+            let mut disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok((text, transient)) => {
+                        dirty |= log.push(&text, transient);
                     }
-                    
-                    // Try to receive a line (non-blocking)
-                    match rx.try_recv() {
-                        Ok(line_content) => {
-                            if !line_content.trim().is_empty() {
-                                // Clean line: strip ANSI escape sequences and control chars
-                                let mut cleaned = String::new();
-                                let mut chars = line_content.chars().peekable();
-                                while let Some(c) = chars.next() {
-                                    if c == '\x1b' {
-                                        // Skip entire ANSI sequence: ESC[ ... final_byte
-                                        if chars.peek() == Some(&'[') {
-                                            chars.next();
-                                            while let Some(&nc) = chars.peek() {
-                                                chars.next();
-                                                if nc.is_ascii_alphabetic() || nc == '~' { break; }
-                                            }
-                                        }
-                                    } else if c == '\r' {
-                                        continue;
-                                    } else if c.is_ascii_graphic() || c == ' ' {
-                                        cleaned.push(c);
-                                    }
-                                }
-                                
-                                if cleaned.trim().is_empty() { continue; }
-                                
-                                // Progress lines: replace last line
-                                if cleaned.contains("in @") && cleaned.contains("out @")
-                                    && !output_lines.is_empty() { output_lines.pop(); }
-                                
-                                output_lines.push(cleaned);
-                                render_output_area(&output_lines, output_start_y, output_height, width);
-                                refresh();
-                            }
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {
-                            // No data available, check if process is still running
-                            if let Some(status) = process.try_wait().unwrap_or(None) {
-                                // Process finished, drain remaining messages
-                                while let Ok(line_content) = rx.try_recv() {
-                                    if !line_content.trim().is_empty() {
-                                        // Clean line: strip ANSI escape sequences and control chars
-                                        let mut cleaned = String::new();
-                                        let mut chars = line_content.chars().peekable();
-                                        while let Some(c) = chars.next() {
-                                            if c == '\x1b' {
-                                                if chars.peek() == Some(&'[') {
-                                                    chars.next();
-                                                    while let Some(&nc) = chars.peek() {
-                                                        chars.next();
-                                                        if nc.is_ascii_alphabetic() || nc == '~' { break; }
-                                                    }
-                                                }
-                                            } else if c == '\r' {
-                                                continue;
-                                            } else if c.is_ascii_graphic() || c == ' ' {
-                                                cleaned.push(c);
-                                            }
-                                        }
-                                        
-                                        if cleaned.trim().is_empty() { continue; }
-                                        
-                                        if cleaned.contains("in @") && cleaned.contains("out @")
-                                            && !output_lines.is_empty() { output_lines.pop(); }
-                                        
-                                        output_lines.push(cleaned);
-                                        render_output_area(&output_lines, output_start_y, output_height, width);
-                                        refresh();
-                                    }
-                                }
-                                
-                                // Wait for threads to finish
-                                let _ = stdout_thread.join();
-                                let _ = stderr_thread.join();
-                                
-                                let return_code = status.success();
-                                
-                                // Show completion message
-                                let completion_msg = if return_code {
-                                    "✓ Snapshots created successfully! Press any key to continue..."
-                                } else {
-                                    "✗ Error creating snapshots! Press any key to continue..."
-                                };
-                                
-                                if return_code {
-                                    attron(COLOR_PAIR(3) | A_BOLD());
-                                } else {
-                                    attron(COLOR_PAIR(4) | A_BOLD());
-                                }
-                                
-                                mvaddstr(height - 2, (width - completion_msg.chars().count() as i32) / 2, completion_msg);
-                                
-                                if return_code {
-                                    attroff(COLOR_PAIR(3) | A_BOLD());
-                                } else {
-                                    attroff(COLOR_PAIR(4) | A_BOLD());
-                                }
-                                
-                                refresh();
-                                
-                                // Wait for key press
-                                timeout(-1);
-                                getch();
-                                timeout(100);
-                                
-                                return (return_code, format!("btrbk completed with status: {}", if return_code { "success" } else { "error" }));
-                            }
-                            
-                            // Small delay to prevent high CPU usage
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            // Channel closed, process finished
-                            let return_code = process.wait().map(|status| status.success()).unwrap_or(false);
-                            timeout(100);
-                            return (return_code, format!("btrbk completed with status: {}", if return_code { "success" } else { "error" }));
-                        }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
                     }
                 }
             }
-            Err(_) => {
-                timeout(100);  // Restore normal timeout
-                (false, "btrbk command not found".to_string())
+            if dirty {
+                render_output_area(&log.lines, output_start_y, output_height);
+                refresh();
+            }
+            // Si esce solo a btrbk terminato, così l'escalation a SIGKILL qui
+            // sopra resta attiva finché serve. Se qualcuno tiene ancora aperte
+            // le pipe dopo la sua uscita non lo si aspetta all'infinito.
+            if exited_at.is_none() && matches!(process.try_wait(), Ok(Some(_))) {
+                exited_at = Some(Instant::now());
+            }
+            if let Some(since) = exited_at
+                && (disconnected || (!dirty && since.elapsed() > Duration::from_millis(500)))
+            {
+                break;
             }
         }
+
+        let succeeded = process.wait().map(|status| status.success()).unwrap_or(false);
+        timeout(100);
+
+        if cancelled_at.is_some() {
+            // btrbk has cleaned up and gone: whatever ignored SIGINT must not
+            // outlive the cancel as an orphan running as root
+            unsafe { libc::kill(group, libc::SIGKILL) };
+            return Err("cancelled by user".to_string());
+        }
+
+        // ASCII only: under pkexec the locale is C and glyphs would be garbled
+        let (pair, message) = if succeeded {
+            (3, "[OK] Snapshots created successfully! Press any key to continue...")
+        } else {
+            (4, "[FAILED] Error creating snapshots! Press any key to continue...")
+        };
+        attron(COLOR_PAIR(pair) | A_BOLD());
+        put_centered(height - 2, message);
+        attroff(COLOR_PAIR(pair) | A_BOLD());
+        refresh();
+
+        timeout(-1);
+        getch();
+        timeout(100);
+
+        if succeeded {
+            Ok(())
+        } else {
+            Err(log
+                .lines
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "btrbk exited with an error".to_string()))
+        }
     }
-    
-    /// Purge old snapshots, keeping the ones still needed by the backup target.
+
+    /// Works out which old snapshots can go, keeping the ones the backup
+    /// target still needs.
     ///
     /// btrbk does not protect snapshots that serve as parent for incremental
     /// backups (see btrbk.conf(5)), so deleting the newest snapshot the target
@@ -429,857 +392,1012 @@ impl App {
     /// that means hours of transfer. We therefore keep the newest snapshot
     /// present on the target *and* everything after it.
     ///
-    /// Returns (-2, []) when the target cannot be queried, (-1, []) on error.
-    fn purge_old_snapshots(&self) -> (i32, Vec<String>) {
-        let snapshots_dir = &self.config.snapshots_dir;
+    /// Fails when the target cannot be queried: the caller must then refuse to
+    /// purge, since it cannot tell which snapshot is still needed.
+    fn plan_purge(&self) -> Result<PurgePlan, String> {
+        let target_uuids = target_received_uuids()?;
 
-        let target_uuids = match target_received_uuids() {
-            Some(uuids) => uuids,
-            None => return (-2, Vec::new()),
-        };
+        let entries = fs::read_dir(&self.config.snapshots_dir)
+            .map_err(|err| format!("cannot read snapshots directory: {}", err))?;
+        let names = entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned());
 
-        match fs::read_dir(snapshots_dir) {
-            Ok(entries) => {
-                let mut all_snapshots: Vec<String> = entries
-                    .filter_map(|entry| {
-                        let entry = entry.ok()?;
-                        if entry.path().is_dir() {
-                            let name = entry.file_name().to_string_lossy().into_owned();
-                            if name.starts_with('@') && name.contains('.') {
-                                Some(entry.path().to_string_lossy().into_owned())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
+        let snapshots_dir = Path::new(&self.config.snapshots_dir);
+        let groups: Vec<PurgeCandidates> = group_snapshots(names)
+            .into_iter()
+            .map(|(prefix, mut snapshots)| {
+                snapshots.reverse(); // oldest first
+                let with_uuid = snapshots
+                    .into_iter()
+                    .map(|name| {
+                        let uuid = local_subvolume_uuid(&snapshots_dir.join(&name));
+                        (name, uuid)
                     })
                     .collect();
-                
-                if all_snapshots.is_empty() {
-                    return (0, Vec::new());
-                }
-                
-                // Sort snapshots
-                all_snapshots.sort();
-                
-                // Group by type and find old snapshots to delete
-                let mut to_delete = Vec::new();
-                
-                let process_type = |prefix: &str, snapshots: &[String], to_delete: &mut Vec<String>| {
-                    let type_snapshots: Vec<&String> = snapshots
-                        .iter()
-                        .filter(|s| {
-                            let basename = s.split('/').next_back().unwrap_or("");
-                            basename.starts_with(&format!("{}.", prefix))
-                        })
-                        .collect();
+                (prefix, with_uuid)
+            })
+            .collect();
 
-                    if type_snapshots.len() <= 1 {
-                        return;
-                    }
-
-                    // newest local snapshot the target also holds: it is the
-                    // parent for the next incremental send and must survive,
-                    // together with everything newer than it
-                    let mut keep_from: Option<usize> = None;
-                    for (index, snapshot) in type_snapshots.iter().enumerate() {
-                        if let Some(uuid) = local_subvolume_uuid(snapshot)
-                            && target_uuids.contains(&uuid)
-                        {
-                            keep_from = Some(index);
-                        }
-                    }
-
-                    // nothing in common with the target: the chain is already
-                    // broken, deleting more would only force a bigger full send
-                    let Some(keep_from) = keep_from else { return };
-
-                    for snapshot in &type_snapshots[..keep_from] {
-                        to_delete.push((*snapshot).clone());
-                    }
-                };
-                
-                // Get all unique prefixes dynamically
-                let mut prefixes = std::collections::HashSet::new();
-                for snapshot_path in &all_snapshots {
-                    let basename = snapshot_path.split('/').next_back().unwrap_or("");
-                    if let Some(prefix) = basename.split('.').next()
-                        && prefix.starts_with('@') {
-                            prefixes.insert(prefix.to_string());
-                        }
-                }
-                
-                // Process each prefix dynamically
-                for prefix in prefixes {
-                    process_type(&prefix, &all_snapshots, &mut to_delete);
-                }
-                
-                if to_delete.is_empty() {
-                    return (0, Vec::new());
-                }
-                
-                // Delete old snapshots
-                let mut deleted_count = 0;
-                let deleted_names: Vec<String> = to_delete
-                    .iter()
-                    .map(|path| path.split('/').next_back().unwrap_or("").to_string())
-                    .collect();
-                
-                for snapshot_path in &to_delete {
-                    if run_command(&["btrfs", "subvolume", "delete", snapshot_path]) {
-                        deleted_count += 1;
-                    }
-                }
-                
-                (deleted_count, deleted_names)
-            }
-            Err(_) => (-1, Vec::new()), // Error occurred
-        }
+        Ok(compute_purge_plan(&groups, &target_uuids))
     }
-    
-    fn clean_broken_subvolumes(&self) -> (i32, Vec<String>) {
-        let btr_pool_dir = &self.config.btr_pool_dir;
-        
-        match std::fs::read_dir(btr_pool_dir) {
-            Ok(entries) => {
-                let mut broken_subvolumes = Vec::new();
-                
-                // Find all .BROKEN subvolumes
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir()
-                        && let Some(name) = path.file_name().and_then(|n| n.to_str())
-                            && name.contains(".BROKEN") {
-                                broken_subvolumes.push(path);
-                            }
-                }
-                
-                if broken_subvolumes.is_empty() {
-                    return (0, Vec::new());
-                }
-                
-                // Delete .BROKEN subvolumes
-                let mut deleted_count = 0;
-                let mut deleted_names = Vec::new();
-                
-                for subvol_path in broken_subvolumes {
-                    if let Some(name) = subvol_path.file_name().and_then(|n| n.to_str())
-                        && run_command(&["btrfs", "subvolume", "delete", &subvol_path.to_string_lossy()]) {
-                            deleted_count += 1;
-                            deleted_names.push(name.to_string());
-                        }
-                }
-                
-                (deleted_count, deleted_names)
+
+    /// Deletes the planned snapshots. Returns (deleted, failed).
+    fn execute_purge(&self, plan: &PurgePlan) -> (usize, usize) {
+        let snapshots_dir = Path::new(&self.config.snapshots_dir);
+        let mut deleted = 0;
+        for name in &plan.delete {
+            let path = snapshots_dir.join(name);
+            if run_command(&["btrfs", "subvolume", "delete", &path.to_string_lossy()]).is_ok() {
+                deleted += 1;
             }
-            Err(_) => (-1, Vec::new()), // Error occurred
         }
+        (deleted, plan.delete.len() - deleted)
     }
-    
+
+    /// Deletes every .BROKEN subvolume in the pool. Returns (deleted, failed).
+    fn clean_broken_subvolumes(&self) -> Result<(usize, usize), String> {
+        let entries = fs::read_dir(&self.config.btr_pool_dir)
+            .map_err(|err| format!("cannot read pool directory: {}", err))?;
+
+        let broken: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().contains(".BROKEN"))
+            })
+            .collect();
+
+        let mut deleted = 0;
+        for path in &broken {
+            if run_command(&["btrfs", "subvolume", "delete", &path.to_string_lossy()]).is_ok() {
+                deleted += 1;
+            }
+        }
+        Ok((deleted, broken.len() - deleted))
+    }
+
     fn draw_header(&self) {
         let (_, width) = get_max_yx();
-        
-        let title = "BTRBK TUI v2.6";
+
+        let title = format!("BTRBK TUI v{}", VERSION);
         attron(COLOR_PAIR(5) | A_BOLD());
-        let centered_title = format!("{:^width$}", title, width = width as usize);
-        mvaddstr(0, 0, &truncate_str(&centered_title, width as usize - 1));
+        put(0, 0, &format!("{:^width$}", title, width = width.max(0) as usize));
         attroff(COLOR_PAIR(5) | A_BOLD());
-        
-        // Separator - no color, full width
-        mvaddstr(1, 0, &"-".repeat(width as usize));
+
+        put_separator(1);
     }
-    
+
     fn draw_footer(&self) {
-        let (height, width) = get_max_yx();
-        
-        // Key bindings - show H: Reboot when needed
-        let keys = if self.reboot_needed {
-            vec![
-                "Up/Down: Navigate", "Left/Right: Switch", "ENTER: Select",
-                "S: Settings", "R: Refresh", "I: Snapshot", "P: Purge OLD", "B: Clean BROKEN", "H: REBOOT", "Q: Quit"
-            ]
-        } else {
-            vec![
-                "Up/Down: Navigate", "Left/Right: Switch", "ENTER: Select",
-                "S: Settings", "R: Refresh", "I: Snapshot", "P: Purge OLD", "B: Clean BROKEN", "Q: Quit"
-            ]
+        let (height, _) = get_max_yx();
+
+        let footer_text = match self.screen {
+            Screen::Main => {
+                let mut keys = vec![
+                    "Up/Down: Navigate",
+                    "Left/Right: Switch",
+                    "ENTER: Restore",
+                    "S: Settings",
+                    "R: Refresh",
+                    "I: Snapshot",
+                    "P: Purge OLD",
+                    "B: Clean BROKEN",
+                ];
+                if self.reboot_needed {
+                    keys.push("H: REBOOT");
+                }
+                keys.push("Q: Quit");
+                keys.join(" | ")
+            }
+            Screen::Settings => {
+                "Up/Down: Navigate | ENTER: Edit | SPACE: Toggle | S: Save | ESC: Back | Q: Quit"
+                    .to_string()
+            }
         };
-        let footer_text = keys.join(" | ");
-        
-        // Separator - no color, full width
-        mvaddstr(height - 2, 0, &"-".repeat(width as usize));
-        // Footer text with color
+
+        put_separator(height - 2);
         attron(COLOR_PAIR(5));
-        mvaddstr(height - 1, 0, &truncate_str(&footer_text, width as usize - 1));
+        put(height - 1, 0, &footer_text);
         attroff(COLOR_PAIR(5));
     }
-    
-    fn draw_status(&mut self) {
-        let (height, width) = get_max_yx();
-        
-        // Show temporary status messages first (if active)
-        if !self.status_message.is_empty() && self.status_timeout > 0 {
-            attron(COLOR_PAIR(6));
-            mvaddstr(height - 3, 0, &truncate_str(&self.status_message, width as usize - 1));
-            attroff(COLOR_PAIR(6));
-            self.status_timeout -= 1;
-        } else if self.status_timeout <= 0 {
-            self.status_message.clear();
-            // Show reboot warning only when no temporary messages are active
-            if self.reboot_needed {
-                attron(COLOR_PAIR(4) | A_BOLD());  // Yellow/Warning color
-                let warning_msg = "WARNING: REBOOT REQUIRED - Press H to reboot system";
-                mvaddstr(height - 3, 0, &truncate_str(warning_msg, width as usize - 1));
-                attroff(COLOR_PAIR(4) | A_BOLD());
-            }
-        } else if self.reboot_needed && self.status_message.is_empty() {
-            // Show reboot warning when no temporary messages
-            attron(COLOR_PAIR(4) | A_BOLD());
-            let warning_msg = "WARNING: REBOOT REQUIRED - Press H to reboot system";
-            mvaddstr(height - 3, 0, &truncate_str(warning_msg, width as usize - 1));
-            attroff(COLOR_PAIR(4) | A_BOLD());
-        }
-    }
-    
-    fn draw_main_screen(&mut self) {
-        let (height, width) = get_max_yx();
-        let (snapshot_groups, sorted_prefixes) = self.snapshots_cached();
 
-        if snapshot_groups.is_empty() {
-            attron(COLOR_PAIR(4) | A_BOLD());
-            mvaddstr(height / 2, (width - 20) / 2, "No snapshots found!");
-            attroff(COLOR_PAIR(4) | A_BOLD());
+    fn draw_status(&mut self) {
+        let (height, _) = get_max_yx();
+
+        if self.status_until.is_some_and(|until| Instant::now() < until) {
+            attron(COLOR_PAIR(6));
+            put(height - 3, 0, &self.status_message);
+            attroff(COLOR_PAIR(6));
             return;
         }
 
-        // Ensure selected_col is within bounds
-        if self.selected_col >= sorted_prefixes.len() as i32 {
-            self.selected_col = (sorted_prefixes.len() as i32) - 1;
+        self.status_message.clear();
+        self.status_until = None;
+
+        // Show reboot warning only when no temporary messages are active
+        if self.reboot_needed {
+            attron(COLOR_PAIR(4) | A_BOLD());
+            put(height - 3, 0, "WARNING: REBOOT REQUIRED - Press H to reboot system");
+            attroff(COLOR_PAIR(4) | A_BOLD());
+        }
+    }
+
+    /// Riporta la selezione dentro i limiti: le liste cambiano dopo refresh,
+    /// purge e restore, e una selezione fuori lista sarebbe invisibile.
+    fn clamp_selection(&mut self, groups: &SnapshotGroups) {
+        self.selected_col = self.selected_col.min(groups.len().saturating_sub(1));
+        let rows = groups.get(self.selected_col).map_or(0, |(_, s)| s.len());
+        self.selected_row = self.selected_row.min(rows.saturating_sub(1));
+    }
+
+    fn draw_main_screen(&mut self) {
+        let (height, width) = get_max_yx();
+        let groups = self.snapshots_cached();
+
+        // Show current configuration
+        let config_info = format!(
+            "Pool: {} | Snapshots: {}",
+            self.config.btr_pool_dir, self.config.snapshots_dir
+        );
+        attron(A_DIM());
+        put(2, 2, &config_info);
+        attroff(A_DIM());
+
+        if groups.is_empty() {
+            attron(COLOR_PAIR(4) | A_BOLD());
+            put_centered(height / 2, "No snapshots found!");
+            attroff(COLOR_PAIR(4) | A_BOLD());
+            attron(A_DIM());
+            put_centered(height / 2 + 1, "S: check the paths | I: create snapshots");
+            attroff(A_DIM());
+            return;
         }
 
+        self.clamp_selection(&groups);
+
         // Calculate column positions dynamically
-        let num_cols = sorted_prefixes.len() as i32;
-        let col_width = if num_cols > 0 { (width - 4) / num_cols } else { width - 4 };
+        let col_width = ((width - 4) / groups.len() as i32).max(1);
+        let text_width = (col_width - 2).max(1) as usize;
         let start_y = 4;
-        
-        // Draw column headers
-        attron(COLOR_PAIR(2) | A_BOLD());
-        for (i, prefix) in sorted_prefixes.iter().enumerate() {
-            let col_x = 2 + (i as i32) * col_width;
-            let snapshots_count = snapshot_groups.get(prefix).map_or(0, |v| v.len());
-            let header = format!("{} ({})", prefix.to_uppercase(), snapshots_count);
-            mvaddstr(start_y - 1, col_x, &truncate_str(&header, (col_width - 2).max(0) as usize));
-        }
-        attroff(COLOR_PAIR(2) | A_BOLD());
-        
-        // Draw snapshots for each column
-        let max_display = height - 8; // Leave space for header/footer
-        let empty_vec = Vec::new();
-        
-        for (col_idx, prefix) in sorted_prefixes.iter().enumerate() {
-            let snapshots = snapshot_groups.get(prefix).unwrap_or(&empty_vec);
+        // Rows from start_y down to the line above the status bar; the row in
+        // between is kept for the "more below" indicator
+        let visible = (height - 4 - start_y - 1).max(1) as usize;
+
+        for (col_idx, (prefix, snapshots)) in groups.iter().enumerate() {
             let col_x = 2 + (col_idx as i32) * col_width;
-            
-            for (i, snapshot) in snapshots.iter().enumerate() {
-                if (i as i32) >= max_display || start_y + (i as i32) >= height - 4 {
-                    break;
-                }
-                
-                let y = start_y + (i as i32);
-                let display_name = self.format_snapshot_name(snapshot);
-                
-                let shown = truncate_str(&display_name, (col_width - 2).max(0) as usize);
-                if self.selected_col == col_idx as i32 && (i as i32) == self.selected_row {
+
+            let header = format!("{} ({})", prefix.to_uppercase(), snapshots.len());
+            attron(COLOR_PAIR(2) | A_BOLD());
+            put(start_y - 1, col_x, &truncate_str(&header, text_width));
+            attroff(COLOR_PAIR(2) | A_BOLD());
+
+            // Solo la colonna selezionata scorre, quanto basta a tenere visibile il cursore
+            let first = if col_idx == self.selected_col {
+                (self.selected_row + 1).saturating_sub(visible)
+            } else {
+                0
+            };
+
+            for (row, snapshot) in snapshots.iter().enumerate().skip(first).take(visible) {
+                let y = start_y + (row - first) as i32;
+                let shown = truncate_str(&self.format_snapshot_name(snapshot), text_width);
+                let selected = col_idx == self.selected_col && row == self.selected_row;
+                if selected {
                     attron(COLOR_PAIR(1));
-                    mvaddstr(y, col_x, &shown);
+                }
+                put(y, col_x, &shown);
+                if selected {
                     attroff(COLOR_PAIR(1));
-                } else {
-                    mvaddstr(y, col_x, &shown);
                 }
             }
+
+            if snapshots.len() > visible {
+                let last = (first + visible).min(snapshots.len());
+                let range = format!("[{}-{} of {}]", first + 1, last, snapshots.len());
+                attron(A_DIM());
+                put(start_y + visible as i32, col_x, &truncate_str(&range, text_width));
+                attroff(A_DIM());
+            }
         }
-        
-        // Show current configuration
-        let config_info = format!("Pool: {} | Snapshots: {}", self.config.btr_pool_dir, self.config.snapshots_dir);
-        attron(A_DIM());
-        mvaddstr(2, 2, &truncate_str(&config_info, (width - 4).max(0) as usize));
-        attroff(A_DIM());
     }
-    
+
     fn draw_settings_screen(&self) {
-        let (height, width) = get_max_yx();
-        let settings = [("BTR Pool Directory", "btr_pool_dir"),
-            ("Snapshots Directory", "snapshots_dir"),
-            ("Auto Cleanup .BROKEN", "auto_cleanup"),
-            ("Confirm Actions", "confirm_actions"),
-            ("Show Timestamps", "show_timestamps")];
-        
+        let (height, _) = get_max_yx();
+        let yes_no = |flag: bool| if flag { "Yes" } else { "No" };
+        let values = [
+            self.config.btr_pool_dir.as_str(),
+            self.config.snapshots_dir.as_str(),
+            yes_no(self.config.auto_cleanup),
+            yes_no(self.config.confirm_actions),
+            yes_no(self.config.show_timestamps),
+        ];
+
         let start_y = 4;
-        
+
         attron(COLOR_PAIR(2) | A_BOLD());
-        mvaddstr(start_y - 1, 4, "SETTINGS");
+        put(start_y - 1, 4, "SETTINGS");
         attroff(COLOR_PAIR(2) | A_BOLD());
-        
-        for (i, (label, key)) in settings.iter().enumerate() {
-            if start_y + (i * 2) as i32 >= height - 8 { break; }
-            
+
+        for (i, (label, value)) in SETTINGS.iter().zip(values).enumerate() {
             let y = start_y + (i * 2) as i32;
-            let value = match *key {
-                "btr_pool_dir" => &self.config.btr_pool_dir,
-                "snapshots_dir" => &self.config.snapshots_dir,
-                "auto_cleanup" => if self.config.auto_cleanup { "Yes" } else { "No" },
-                "confirm_actions" => if self.config.confirm_actions { "Yes" } else { "No" },
-                "show_timestamps" => if self.config.show_timestamps { "Yes" } else { "No" },
-                _ => "",
-            };
-            
-            if i as i32 == self.selected_row {
+            if y >= height - 6 {
+                break;
+            }
+
+            if i == self.selected_row {
                 attron(COLOR_PAIR(1));
             }
-            
-            mvaddstr(y, 4, &truncate_str(&format!("{}:", label), (width - 6).max(0) as usize));
-            mvaddstr(y + 1, 6, &truncate_str(value, (width - 8).max(0) as usize));
-            
-            if i as i32 == self.selected_row {
+            put(y, 4, &format!("{}:", label));
+            put(y + 1, 6, value);
+            if i == self.selected_row {
                 attroff(COLOR_PAIR(1));
             }
         }
-        
+
         // Config file info
-        attron(A_DIM());
-        let config_path = format!("Config: {}", self.config_path.display());
         let config_exists = if self.config_path.exists() { "EXISTS" } else { "NOT FOUND" };
-        let config_info = format!("{} ({})", config_path, config_exists);
-        mvaddstr(height - 7, 4, &truncate_str(&config_info, (width - 6).max(0) as usize));
-        mvaddstr(height - 6, 4, "ENTER: Edit | SPACE: Toggle | ESC: Back | S: Save");
+        attron(A_DIM());
+        put(
+            height - 5,
+            4,
+            &format!("Config: {} ({})", self.config_path.display(), config_exists),
+        );
         attroff(A_DIM());
     }
-    
+
+    fn draw_screen(&mut self) {
+        // erase() e non clear(): clear() forza il ridisegno completo del
+        // terminale ad ogni refresh, cioè sfarfallio a ogni frame
+        erase();
+        self.draw_header();
+        match self.screen {
+            Screen::Main => self.draw_main_screen(),
+            Screen::Settings => self.draw_settings_screen(),
+        }
+        self.draw_status();
+        self.draw_footer();
+    }
+
     fn confirm_dialog(&self, message: &str) -> bool {
         if !self.config.confirm_actions {
             return true;
         }
-        
+
         let (height, width) = get_max_yx();
-        let dialog_width = std::cmp::min(message.len() + 10, width as usize - 4);
+        let width = width.max(0) as usize;
+        let hint = "Y: Yes | N: No";
+        let wanted = message.chars().count().max(hint.len()) + 6;
+        let dialog_width = wanted.min(width.saturating_sub(4)).max(8);
         let dialog_height = 5;
         let dialog_y = height / 2 - 2;
-        let dialog_x = (width as usize - dialog_width) / 2;
-        
-        // Draw dialog
-        for i in 0..dialog_height {
-            mvaddstr(dialog_y + i, dialog_x as i32, &" ".repeat(dialog_width));
-        }
-        
-        let top_border = format!("+{}+", "-".repeat(dialog_width - 2));
-        mvaddstr(dialog_y, dialog_x as i32, &top_border);
-        mvaddstr(dialog_y + dialog_height - 1, dialog_x as i32, &top_border);
+        let dialog_x = (width.saturating_sub(dialog_width) / 2) as i32;
+        let inner = dialog_width - 2;
+
+        let border = format!("+{}+", "-".repeat(inner));
+        let blank = format!("|{}|", " ".repeat(inner));
+        attron(A_BOLD());
+        put(dialog_y, dialog_x, &border);
         for i in 1..dialog_height - 1 {
-            mvaddstr(dialog_y + i, dialog_x as i32, "|");
-            mvaddstr(dialog_y + i, (dialog_x + dialog_width - 1) as i32, "|");
+            put(dialog_y + i, dialog_x, &blank);
         }
-        
-        mvaddstr(dialog_y + 1, (dialog_x + 2) as i32, &truncate_str(message, dialog_width - 4));
-        mvaddstr(dialog_y + 3, (dialog_x + 2) as i32, "Y: Yes | N: No");
+        put(dialog_y + dialog_height - 1, dialog_x, &border);
+        attroff(A_BOLD());
+
+        put(dialog_y + 1, dialog_x + 3, &truncate_str(message, inner.saturating_sub(4)));
+        put(dialog_y + 3, dialog_x + 3, &truncate_str(hint, inner.saturating_sub(4)));
         refresh();
-        
-        loop {
+
+        timeout(-1);
+        let answer = loop {
             match getch() {
-                121 | 89 => return true,  // 'y' or 'Y'
-                110 | 78 | 27 => return false,  // 'n' or 'N' or ESC
-                _ => continue,
+                KEY_ESC => break false,
+                key => match key_char(key) {
+                    Some('y') => break true,
+                    Some('n') => break false,
+                    _ => {}
+                },
             }
-        }
+        };
+        timeout(100);
+        answer
     }
-    
-    fn restore_snapshot(&self, snapshot: &str, snapshot_type: &str) -> RestoreOutcome {
+
+    /// Replaces the subvolume `subvol_name` (e.g. "@home") with a writable
+    /// snapshot of `snapshot`, keeping the previous one as .BROKEN.
+    fn restore_snapshot(&self, snapshot: &str, subvol_name: &str) -> RestoreOutcome {
         let source_path = Path::new(&self.config.snapshots_dir).join(snapshot);
 
         // Pre-check: lo snapshot sorgente deve esistere prima di toccare il subvolume corrente
         if !source_path.exists() {
-            return RestoreOutcome::Failed;
+            return RestoreOutcome::Failed(format!("{} no longer exists", source_path.display()));
         }
 
-        // Dynamic subvolume path generation
-        let subvol_name = if snapshot_type.is_empty() || snapshot_type == "root" {
-            "@".to_string()
-        } else {
-            format!("@{}", snapshot_type)
-        };
-
-        let current_subvol = Path::new(&self.config.btr_pool_dir).join(&subvol_name);
+        let pool = Path::new(&self.config.btr_pool_dir);
+        let current_subvol = pool.join(subvol_name);
         // Generate unique .BROKEN name with timestamp
         let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        let broken_subvol = Path::new(&self.config.btr_pool_dir).join(format!("{}.BROKEN.{}", subvol_name, timestamp));
-        let new_subvol = current_subvol.clone();
+        let broken_subvol = pool.join(format!("{}.BROKEN.{}", subvol_name, timestamp));
 
         let current_existed = current_subvol.exists();
 
-        // Guardia: se il subvolume corrente esiste, deve essere un vero subvolume btrfs
-        // prima di spostarlo (evita di spostare/distruggere una directory normale per errore)
-        if current_existed
-            && !run_command(&["btrfs", "subvolume", "show", &current_subvol.to_string_lossy()])
-        {
-            return RestoreOutcome::Failed;
+        if current_existed {
+            // Guardia: deve essere un vero subvolume btrfs prima di spostarlo
+            // (evita di spostare/distruggere una directory normale per errore)
+            if let Err(reason) =
+                run_command(&["btrfs", "subvolume", "show", &current_subvol.to_string_lossy()])
+            {
+                return RestoreOutcome::Failed(format!(
+                    "{} is not a btrfs subvolume: {}",
+                    current_subvol.display(),
+                    reason
+                ));
+            }
+
+            // rename(2) would silently replace an empty directory
+            if broken_subvol.exists() {
+                return RestoreOutcome::Failed(format!("{} already exists", broken_subvol.display()));
+            }
+
+            // Move current to .BROKEN. rename(2) e non mv: tra filesystem
+            // diversi fallisce, invece di mettersi a copiare un subvolume
+            if let Err(err) = fs::rename(&current_subvol, &broken_subvol) {
+                return RestoreOutcome::Failed(format!("cannot move {}: {}", subvol_name, err));
+            }
         }
 
-        // Move current to .BROKEN
-        if current_existed
-            && !run_command(&["mv", &current_subvol.to_string_lossy(), &broken_subvol.to_string_lossy()])
-        {
-            return RestoreOutcome::Failed;
-        }
+        // Rollback: rimette al suo posto il subvolume originale
+        let roll_back = |reason: String| -> RestoreOutcome {
+            if current_existed && let Err(err) = fs::rename(&broken_subvol, &current_subvol) {
+                return RestoreOutcome::RollbackFailed(format!(
+                    "{}; original kept as {} ({})",
+                    reason,
+                    broken_subvol.display(),
+                    err
+                ));
+            }
+            RestoreOutcome::Failed(reason)
+        };
 
         // Create new snapshot
-        if !run_command(&["btrfs", "subvolume", "snapshot", &source_path.to_string_lossy(), &new_subvol.to_string_lossy()]) {
-            // Rollback: ripristina il subvolume originale
-            if current_existed
-                && !run_command(&["mv", &broken_subvol.to_string_lossy(), &current_subvol.to_string_lossy()])
-            {
-                return RestoreOutcome::RollbackFailed;
-            }
-            return RestoreOutcome::Failed;
+        if let Err(reason) = run_command(&[
+            "btrfs",
+            "subvolume",
+            "snapshot",
+            &source_path.to_string_lossy(),
+            &current_subvol.to_string_lossy(),
+        ]) {
+            return roll_back(format!("snapshot failed: {}", reason));
         }
 
         // Verifica che il restore sia andato a buon fine
-        if !self.verify_restore_success(&new_subvol, snapshot_type) {
+        if let Err(reason) = self.verify_restore_success(&current_subvol, subvol_name) {
             // Rollback completo: rimuovi il subvolume fallito e ripristina l'originale
-            if !run_command(&["btrfs", "subvolume", "delete", &new_subvol.to_string_lossy()]) {
-                // Il subvolume fallito occupa ancora il path: impossibile ripristinare l'originale
-                return RestoreOutcome::RollbackFailed;
-            }
-            if current_existed
-                && !run_command(&["mv", &broken_subvol.to_string_lossy(), &current_subvol.to_string_lossy()])
+            if let Err(err) =
+                run_command(&["btrfs", "subvolume", "delete", &current_subvol.to_string_lossy()])
             {
-                return RestoreOutcome::RollbackFailed;
+                // Il subvolume fallito occupa ancora il path: impossibile ripristinare l'originale
+                return RestoreOutcome::RollbackFailed(format!(
+                    "{}; cannot remove the failed restore ({}), original kept as {}",
+                    reason,
+                    err,
+                    broken_subvol.display()
+                ));
             }
-            return RestoreOutcome::Failed;
+            return roll_back(reason);
         }
 
         // Auto cleanup if enabled - rimuovi .BROKEN solo se il restore è andato a buon fine
         if self.config.auto_cleanup && current_existed {
-            run_command(&["btrfs", "subvolume", "delete", &broken_subvol.to_string_lossy()]);
+            let _ = run_command(&["btrfs", "subvolume", "delete", &broken_subvol.to_string_lossy()]);
         }
 
         RestoreOutcome::Success
     }
-    
-    fn verify_restore_success(&self, restored_subvol: &Path, snapshot_type: &str) -> bool {
+
+    fn verify_restore_success(&self, restored_subvol: &Path, subvol_name: &str) -> Result<(), String> {
         // 1. Verifica che il subvolume esista
         if !restored_subvol.exists() {
-            return false;
+            return Err("restored subvolume is missing".to_string());
         }
-        
+
         // 2. Verifica che sia un subvolume btrfs valido
-        if !run_command(&["btrfs", "subvolume", "show", &restored_subvol.to_string_lossy()]) {
-            return false;
-        }
-        
-        // 3. Verifica file/directory critici in base al tipo di subvolume
-        match snapshot_type {
-            "root" => {
-                let critical_dirs = ["etc", "usr", "var", "bin"];
-                for dir in &critical_dirs {
+        run_command(&["btrfs", "subvolume", "show", &restored_subvol.to_string_lossy()])
+            .map_err(|reason| format!("restored path is not a subvolume: {}", reason))?;
+
+        // 3. Verifica file/directory critici in base al subvolume
+        match subvol_name {
+            "@" => {
+                for dir in ["etc", "usr", "var", "bin"] {
                     if !restored_subvol.join(dir).exists() {
-                        return false;
+                        return Err(format!("restored root has no /{}", dir));
                     }
                 }
-                let critical_files = ["etc/fstab", "etc/passwd"];
-                for file in &critical_files {
-                    let file_path = restored_subvol.join(file);
-                    if !file_path.exists() || !file_path.is_file() {
-                        return false;
+                for file in ["etc/fstab", "etc/passwd"] {
+                    if !restored_subvol.join(file).is_file() {
+                        return Err(format!("restored root has no /{}", file));
                     }
                 }
             }
-            "home" => {
-                match fs::read_dir(restored_subvol) {
-                    Ok(entries) => {
-                        if entries.count() == 0 {
-                            return false;
-                        }
-                    }
-                    Err(_) => return false,
+            "@home" => {
+                let mut entries = fs::read_dir(restored_subvol)
+                    .map_err(|err| format!("restored home is unreadable: {}", err))?;
+                if entries.next().is_none() {
+                    return Err("restored home is empty".to_string());
                 }
             }
             _ => {
-                // Per qualsiasi altro tipo (@games, @work, @custom, ecc.):
+                // Per qualsiasi altro subvolume (@games, @work, @custom, ecc.):
                 // verifica solo che sia leggibile
-                if fs::read_dir(restored_subvol).is_err() {
-                    return false;
-                }
+                fs::read_dir(restored_subvol)
+                    .map_err(|err| format!("restored subvolume is unreadable: {}", err))?;
             }
         }
-        
-        true
-    }
-    
-    fn handle_main_input(&mut self, key: i32) {
-        let (snapshot_groups, sorted_prefixes) = self.snapshots_cached();
 
-        if sorted_prefixes.is_empty() {
-            return;
-        }
-        
-        // Ensure selected_col is within bounds
-        if self.selected_col >= sorted_prefixes.len() as i32 {
-            self.selected_col = (sorted_prefixes.len() as i32) - 1;
-        }
-        
-        let empty_vec = Vec::new();
-        let current_snapshots = snapshot_groups.get(&sorted_prefixes[self.selected_col as usize]).unwrap_or(&empty_vec);
-        
+        Ok(())
+    }
+
+    fn handle_main_input(&mut self, key: i32) {
+        let groups = self.snapshots_cached();
+        self.clamp_selection(&groups);
+
         match key {
-            KEY_UP => {
-                if self.selected_row > 0 {
-                    self.selected_row -= 1;
-                }
-            }
+            KEY_UP => self.selected_row = self.selected_row.saturating_sub(1),
             KEY_DOWN => {
-                if self.selected_row < (current_snapshots.len() as i32) - 1 {
-                    self.selected_row += 1;
-                }
+                self.selected_row += 1;
+                self.clamp_selection(&groups);
             }
             KEY_LEFT => {
-                if self.selected_col > 0 {
-                    self.selected_col -= 1;
-                    // Adjust row if new column has fewer items
-                    let empty_vec = Vec::new();
-                    let new_snapshots = snapshot_groups.get(&sorted_prefixes[self.selected_col as usize]).unwrap_or(&empty_vec);
-                    if self.selected_row >= new_snapshots.len() as i32 && !new_snapshots.is_empty() {
-                        self.selected_row = (new_snapshots.len() as i32) - 1;
-                    } else if new_snapshots.is_empty() {
-                        self.selected_row = 0;
-                    }
-                }
+                self.selected_col = self.selected_col.saturating_sub(1);
+                self.clamp_selection(&groups);
             }
             KEY_RIGHT => {
-                if self.selected_col < (sorted_prefixes.len() as i32) - 1 {
-                    self.selected_col += 1;
-                    // Adjust row if new column has fewer items
-                    let empty_vec = Vec::new();
-                    let new_snapshots = snapshot_groups.get(&sorted_prefixes[self.selected_col as usize]).unwrap_or(&empty_vec);
-                    if self.selected_row >= new_snapshots.len() as i32 && !new_snapshots.is_empty() {
-                        self.selected_row = (new_snapshots.len() as i32) - 1;
-                    } else if new_snapshots.is_empty() {
-                        self.selected_row = 0;
-                    }
+                self.selected_col += 1;
+                self.clamp_selection(&groups);
+            }
+            KEY_HOME => self.selected_row = 0,
+            KEY_END => {
+                self.selected_row = usize::MAX;
+                self.clamp_selection(&groups);
+            }
+            KEY_LF | KEY_CR | KEY_ENTER => self.handle_snapshot_selection(&groups),
+            _ => match key_char(key) {
+                Some('s') => {
+                    self.screen = Screen::Settings;
+                    self.selected_row = 0;
                 }
-            }
-            10 | 13 => {  // Enter
-                self.handle_snapshot_selection(&snapshot_groups, &sorted_prefixes);
-            }
-            115 | 83 => {  // 's' or 'S'
-                self.current_screen = "settings".to_string();
-                self.selected_row = 0;
-            }
-            114 | 82 => {  // 'r' or 'R'
-                self.invalidate_snapshots();
-                self.set_status("Snapshots refreshed", 30);
-            }
-            104 | 72 => {  // 'h' or 'H'
-                if self.reboot_needed {
-                    if self.confirm_dialog("Reboot system now?") {
-                        run_command(&["sync"]);
-                        run_command(&["reboot"]);
-                    } else {
-                        self.set_status("Reboot cancelled", 30);
-                    }
-                } else {
-                    self.set_status("No reboot needed", 30);
-                }
-            }
-            112 | 80 => {  // 'p' or 'P'
-                if self.confirm_dialog("Purge old snapshots (keeps what the backup target still needs)?") {
-                    // querying the target over ssh takes a moment: say so before blocking
-                    self.set_status("Checking backup target, then purging...", 30);
-                    refresh();
-
-                    let (deleted_count, _deleted_list) = self.purge_old_snapshots();
+                Some('r') => {
                     self.invalidate_snapshots();
-
-                    if deleted_count == -2 {
-                        self.set_status("Backup target unreachable: nothing purged (chain left intact)", 150);
-                    } else if deleted_count == -1 {
-                        self.set_status("Error: cannot read snapshots directory", 100);
-                    } else if deleted_count == 0 {
-                        self.set_status("No old snapshots to purge", 50);
-                    } else {
-                        self.set_status(&format!("Purged {} old snapshots successfully", deleted_count), 150);
-                    }
-                } else {
-                    self.set_status("Purge cancelled", 30);
+                    self.set_status("Snapshots refreshed", STATUS_SHORT);
                 }
-            }
-            98 | 66 => {  // 'b' or 'B'
-                if self.confirm_dialog("Delete all .BROKEN subvolumes?") {
-                    self.set_status("Cleaning .BROKEN subvolumes...", 30);
-                    refresh();
-                    
-                    let (deleted_count, _deleted_list) = self.clean_broken_subvolumes();
-                    self.invalidate_snapshots();
-
-                    if deleted_count == -1 {
-                        self.set_status("Error: cannot read pool directory", 100);
-                    } else if deleted_count == 0 {
-                        self.set_status("No .BROKEN subvolumes found", 50);
-                    } else {
-                        self.set_status(&format!("Cleaned {} .BROKEN subvolumes successfully", deleted_count), 150);
-                    }
-                } else {
-                    self.set_status("Clean cancelled", 30);
-                }
-            }
-            105 | 73 => {  // 'i' or 'I'
-                if self.confirm_dialog("Create new snapshots with btrbk?") {
-                    let (success, message) = self.create_snapshot();
-                    if success {
-                        self.invalidate_snapshots();
-                        self.set_status("Snapshots created successfully", 100);
-                    } else {
-                        self.set_status(&format!("Snapshot creation failed: {}", message), 150);
-                    }
-                } else {
-                    self.set_status("Snapshot creation cancelled", 30);
-                }
-            }
-            _ => {}
+                Some('h') => self.handle_reboot(),
+                Some('p') => self.handle_purge(),
+                Some('b') => self.handle_clean_broken(),
+                Some('i') => self.handle_create_snapshot(),
+                _ => {}
+            },
         }
     }
-    
-    fn handle_snapshot_selection(&mut self, snapshot_groups: &std::collections::HashMap<String, Vec<String>>, sorted_prefixes: &[String]) {
-        if sorted_prefixes.is_empty() || self.selected_col >= sorted_prefixes.len() as i32 {
-            return;
-        }
-        
-        let current_prefix = &sorted_prefixes[self.selected_col as usize];
-        let empty_vec = Vec::new();
-        let current_snapshots = snapshot_groups.get(current_prefix).unwrap_or(&empty_vec);
-        
-        if current_snapshots.is_empty() || self.selected_row >= current_snapshots.len() as i32 {
-            return;
-        }
-        
-        let snapshot = &current_snapshots[self.selected_row as usize];
-        
-        // Extract snapshot type from prefix
-        let snapshot_type = if current_prefix == "@" {
-            "root"  // Special case for root subvolume
-        } else if let Some(stripped) = current_prefix.strip_prefix('@') {
-            stripped  // Remove @ prefix for others
-        } else {
-            current_prefix
-        };
-        
-        if !self.confirm_dialog(&format!("Restore {} snapshot?", snapshot_type)) {
-            self.set_status("Restore cancelled", 30);
-            return;
-        }
-        
-        self.set_status("Restoring snapshot...", 30);
-        refresh();
 
-        let snapshot = snapshot.clone();
-        let snapshot_type = snapshot_type.to_string();
-        match self.restore_snapshot(&snapshot, &snapshot_type) {
+    fn handle_reboot(&mut self) {
+        if !self.reboot_needed {
+            self.set_status("No reboot needed", STATUS_SHORT);
+        } else if self.confirm_dialog("Reboot system now?") {
+            let _ = run_command(&["sync"]);
+            if let Err(reason) = run_command(&["reboot"]) {
+                self.set_status(&format!("Error: reboot failed: {}", reason), STATUS_LONG);
+            }
+        } else {
+            self.set_status("Reboot cancelled", STATUS_SHORT);
+        }
+    }
+
+    fn handle_purge(&mut self) {
+        // querying the target over ssh takes a moment: say so before blocking
+        self.show_busy("Checking backup target...");
+
+        let plan = match self.plan_purge() {
+            Ok(plan) => plan,
+            Err(reason) => {
+                self.set_status(
+                    &format!("Nothing purged (chain left intact): {}", reason),
+                    STATUS_RESULT,
+                );
+                return;
+            }
+        };
+
+        let skipped = if plan.skipped.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} skipped: not on the backup target)", plan.skipped.join(", "))
+        };
+
+        if plan.delete.is_empty() {
+            self.set_status(&format!("No old snapshots to purge{}", skipped), STATUS_LONG);
+            return;
+        }
+
+        self.draw_screen();
+        let question = format!(
+            "Delete {} old snapshots? The backup chain is kept.",
+            plan.delete.len()
+        );
+        if !self.confirm_dialog(&question) {
+            self.set_status("Purge cancelled", STATUS_SHORT);
+            return;
+        }
+
+        self.show_busy("Purging old snapshots...");
+        let (deleted, failed) = self.execute_purge(&plan);
+        self.invalidate_snapshots();
+
+        if failed == 0 {
+            self.set_status(&format!("Purged {} old snapshots{}", deleted, skipped), STATUS_RESULT);
+        } else {
+            self.set_status(
+                &format!("Purged {} old snapshots, {} could NOT be deleted{}", deleted, failed, skipped),
+                STATUS_RESULT,
+            );
+        }
+    }
+
+    fn handle_clean_broken(&mut self) {
+        if !self.confirm_dialog("Delete all .BROKEN subvolumes?") {
+            self.set_status("Clean cancelled", STATUS_SHORT);
+            return;
+        }
+
+        self.show_busy("Cleaning .BROKEN subvolumes...");
+        match self.clean_broken_subvolumes() {
+            Err(reason) => self.set_status(&format!("Error: {}", reason), STATUS_LONG),
+            Ok((0, 0)) => self.set_status("No .BROKEN subvolumes found", STATUS_MEDIUM),
+            Ok((deleted, 0)) => {
+                self.set_status(&format!("Cleaned {} .BROKEN subvolumes", deleted), STATUS_RESULT);
+            }
+            Ok((deleted, failed)) => self.set_status(
+                &format!(
+                    "Cleaned {} .BROKEN subvolumes, {} could NOT be deleted (still mounted?)",
+                    deleted, failed
+                ),
+                STATUS_RESULT,
+            ),
+        }
+    }
+
+    fn handle_create_snapshot(&mut self) {
+        if !self.confirm_dialog("Create new snapshots with btrbk?") {
+            self.set_status("Snapshot creation cancelled", STATUS_SHORT);
+            return;
+        }
+
+        let result = self.create_snapshot();
+        // anche un run interrotto può aver già creato degli snapshot
+        self.invalidate_snapshots();
+        match result {
+            Ok(()) => self.set_status("Snapshots created successfully", STATUS_LONG),
+            Err(reason) => {
+                self.set_status(&format!("Snapshot creation failed: {}", reason), STATUS_RESULT);
+            }
+        }
+    }
+
+    fn handle_snapshot_selection(&mut self, groups: &SnapshotGroups) {
+        let Some((subvol_name, snapshots)) = groups.get(self.selected_col) else {
+            return;
+        };
+        let Some(snapshot) = snapshots.get(self.selected_row) else {
+            return;
+        };
+
+        // Il subvolume da sostituire è il prefisso dello snapshot, così com'è:
+        // "@" -> @, "@home" -> @home, "@root" -> @root (mai confuso con "@")
+        if !self.confirm_dialog(&format!("Restore {} from {}?", subvol_name, snapshot)) {
+            self.set_status("Restore cancelled", STATUS_SHORT);
+            return;
+        }
+
+        self.show_busy(&format!("Restoring {}...", subvol_name));
+
+        match self.restore_snapshot(snapshot, subvol_name) {
             RestoreOutcome::Success => {
                 self.reboot_needed = true;
-                self.invalidate_snapshots();
-                self.set_status(&format!("{} snapshot restored! Press H to reboot when ready", snapshot_type), 150);
+                self.set_status(
+                    &format!("{} restored! Press H to reboot when ready", subvol_name),
+                    STATUS_RESULT,
+                );
             }
-            RestoreOutcome::Failed => {
-                self.set_status(&format!("Error: {} snapshot restore failed (rolled back)", snapshot_type), 150);
+            RestoreOutcome::Failed(reason) => {
+                self.set_status(
+                    &format!("Error: {} restore failed, rolled back: {}", subvol_name, reason),
+                    STATUS_RESULT,
+                );
             }
-            RestoreOutcome::RollbackFailed => {
-                self.invalidate_snapshots();
-                self.set_status(&format!("CRITICAL: {} restore AND rollback failed - manual recovery needed (.BROKEN kept)", snapshot_type), 300);
+            RestoreOutcome::RollbackFailed(reason) => {
+                self.set_status(
+                    &format!(
+                        "CRITICAL: {} restore AND rollback failed, manual recovery needed: {}",
+                        subvol_name, reason
+                    ),
+                    STATUS_CRITICAL,
+                );
             }
         }
+        self.invalidate_snapshots();
     }
-    
+
     fn handle_settings_input(&mut self, key: i32) {
         match key {
-            KEY_UP => {
-                if self.selected_row > 0 {
-                    self.selected_row -= 1;
-                }
-            }
-            KEY_DOWN => {
-                if self.selected_row < 4 {
-                    self.selected_row += 1;
-                }
-            }
-            10 | 13 => {  // ENTER
-                self.edit_setting();
-            }
-            32 => {  // SPACE
-                self.toggle_setting();
-            }
-            115 | 83 => {  // 's' or 'S'
-                if self.save_config() {
-                    self.set_status("Configuration saved", 50);
-                } else {
-                    self.set_status("Error: failed to save configuration", 100);
-                }
-            }
-            27 => {  // ESC
-                self.current_screen = "main".to_string();
+            KEY_UP => self.selected_row = self.selected_row.saturating_sub(1),
+            KEY_DOWN => self.selected_row = (self.selected_row + 1).min(SETTINGS.len() - 1),
+            KEY_LF | KEY_CR | KEY_ENTER => self.edit_setting(),
+            KEY_SPACE => self.toggle_setting(),
+            KEY_ESC => {
+                self.screen = Screen::Main;
                 self.selected_row = 0;
             }
-            _ => {}
+            _ => {
+                if key_char(key) == Some('s') {
+                    if self.save_config() {
+                        self.set_status("Configuration saved", STATUS_MEDIUM);
+                    } else {
+                        self.set_status("Error: failed to save configuration", STATUS_LONG);
+                    }
+                }
+            }
         }
     }
-    
+
     fn edit_setting(&mut self) {
-        match self.selected_row {
-            0 | 1 => {  // String settings
-                let (height, width) = get_max_yx();
-                let field_name = if self.selected_row == 0 { "btr_pool_dir" } else { "snapshots_dir" };
-                let current_value = if self.selected_row == 0 { &self.config.btr_pool_dir } else { &self.config.snapshots_dir };
-                
-                // Clear area for input
-                for i in 0..5 {
-                    mvaddstr(height / 2 - 2 + i, 4, &" ".repeat(width as usize - 8));
+        if self.selected_row > 1 {
+            self.toggle_setting();
+            return;
+        }
+
+        let (height, width) = get_max_yx();
+        let field_name = if self.selected_row == 0 { "btr_pool_dir" } else { "snapshots_dir" };
+        let current_value = if self.selected_row == 0 {
+            self.config.btr_pool_dir.clone()
+        } else {
+            self.config.snapshots_dir.clone()
+        };
+
+        // Clear area for input
+        let blank = " ".repeat((width - 8).max(0) as usize);
+        for i in 0..5 {
+            put(height / 2 - 2 + i, 4, &blank);
+        }
+
+        let input_y = height / 2 + 1;
+        let input_x = 9;
+        let input_width = (width - input_x - 4).max(1) as usize;
+        put(height / 2 - 1, 4, &format!("Edit {}: ", field_name));
+        put(height / 2, 4, &format!("Current: {}", current_value));
+        put(input_y, 4, "New: ");
+        put(height / 2 + 3, 4, "Press ENTER to confirm, ESC to cancel");
+
+        curs_set(CURSOR_VISIBILITY::CURSOR_VISIBLE);
+        timeout(-1);
+
+        let mut input = String::new();
+        let confirmed = loop {
+            // Se il testo non ci sta si mostra la coda, dove si sta scrivendo
+            let tail: String = {
+                let count = input.chars().count();
+                input.chars().skip(count.saturating_sub(input_width)).collect()
+            };
+            put(input_y, input_x, &" ".repeat(input_width));
+            put(input_y, input_x, &tail);
+            mv(input_y, input_x + tail.chars().count() as i32);
+            refresh();
+
+            match getch() {
+                KEY_LF | KEY_CR | KEY_ENTER => break true,
+                KEY_ESC => break false,
+                KEY_BACKSPACE | KEY_DEL | KEY_BS => {
+                    input.pop();
                 }
-                
-                mvaddstr(height / 2 - 1, 4, &format!("Edit {}: ", field_name));
-                mvaddstr(height / 2, 4, &format!("Current: {}", current_value));
-                mvaddstr(height / 2 + 1, 4, "New: ");
-                mvaddstr(height / 2 + 3, 4, "Press ENTER to confirm, ESC to cancel");
-                refresh();
-                
-                curs_set(CURSOR_VISIBILITY::CURSOR_VISIBLE);
-                
-                let mut input = String::new();
-                let mut ch = getch();
-                
-                while ch != 10 && ch != 13 && ch != 27 {
-                    if ch == KEY_BACKSPACE || ch == 127 || ch == 8 {
-                        if !input.is_empty() {
-                            input.pop();
-                            mvaddstr(height / 2 + 1, 9, &format!("{} ", input));
-                        }
-                    } else if (32..127).contains(&ch) {
-                        input.push(ch as u8 as char);
-                        mvaddstr(height / 2 + 1, 9, &input);
-                    }
-                    refresh();
-                    ch = getch();
-                }
-                
-                curs_set(CURSOR_VISIBILITY::CURSOR_INVISIBLE);
-                
-                if ch != 27 && !input.trim().is_empty() {
-                    let new_path = input.trim().to_string();
-                    let exists = Path::new(&new_path).is_dir();
-                    if self.selected_row == 0 {
-                        self.config.btr_pool_dir = new_path;
-                    } else {
-                        self.config.snapshots_dir = new_path;
-                    }
-                    self.save_config();
-                    self.invalidate_snapshots();
-                    if exists {
-                        self.set_status(&format!("Updated {}", field_name), 50);
-                    } else {
-                        self.set_status(&format!("Updated {} (WARNING: path does not exist)", field_name), 100);
-                    }
-                } else {
-                    self.set_status("Edit cancelled", 30);
-                }
+                ch if (32..127).contains(&ch) => input.push(ch as u8 as char),
+                _ => {}
             }
-            2..=4 => {  // Boolean settings
-                self.toggle_setting();
-            }
-            _ => {}
+        };
+
+        timeout(100);
+        curs_set(CURSOR_VISIBILITY::CURSOR_INVISIBLE);
+
+        let new_path = input.trim().to_string();
+        if !confirmed || new_path.is_empty() {
+            self.set_status("Edit cancelled", STATUS_SHORT);
+            return;
+        }
+
+        let exists = Path::new(&new_path).is_dir();
+        if self.selected_row == 0 {
+            self.config.btr_pool_dir = new_path;
+        } else {
+            self.config.snapshots_dir = new_path;
+        }
+        self.invalidate_snapshots();
+
+        if !self.save_config() {
+            self.set_status(&format!("Updated {} but could NOT save the config file", field_name), STATUS_LONG);
+        } else if exists {
+            self.set_status(&format!("Updated {}", field_name), STATUS_MEDIUM);
+        } else {
+            self.set_status(
+                &format!("Updated {} (WARNING: path does not exist)", field_name),
+                STATUS_LONG,
+            );
         }
     }
-    
+
     fn toggle_setting(&mut self) {
         let (name, toggled) = match self.selected_row {
-            2 => { self.config.auto_cleanup = !self.config.auto_cleanup; ("Auto cleanup", self.config.auto_cleanup) }
-            3 => { self.config.confirm_actions = !self.config.confirm_actions; ("Confirm actions", self.config.confirm_actions) }
-            4 => { self.config.show_timestamps = !self.config.show_timestamps; ("Show timestamps", self.config.show_timestamps) }
+            2 => {
+                self.config.auto_cleanup = !self.config.auto_cleanup;
+                ("Auto cleanup", self.config.auto_cleanup)
+            }
+            3 => {
+                self.config.confirm_actions = !self.config.confirm_actions;
+                ("Confirm actions", self.config.confirm_actions)
+            }
+            4 => {
+                self.config.show_timestamps = !self.config.show_timestamps;
+                ("Show timestamps", self.config.show_timestamps)
+            }
             _ => return,
         };
-        self.save_config();
-        self.set_status(&format!("{}: {}", name, if toggled { "Yes" } else { "No" }), 50);
+        let state = if toggled { "Yes" } else { "No" };
+        if self.save_config() {
+            self.set_status(&format!("{}: {}", name, state), STATUS_MEDIUM);
+        } else {
+            self.set_status(&format!("{}: {} (could NOT save the config file)", name, state), STATUS_LONG);
+        }
     }
-    
+
     fn run(&mut self) {
         curs_set(CURSOR_VISIBILITY::CURSOR_INVISIBLE);
         timeout(100);
         self.init_colors();
-        
+
         loop {
-            clear();
-            
-            self.draw_header();
-            
-            match self.current_screen.as_str() {
-                "main" => self.draw_main_screen(),
-                "settings" => self.draw_settings_screen(),
-                _ => {}
-            }
-            
-            self.draw_status();
-            self.draw_footer();
-            
+            self.draw_screen();
             refresh();
-            
+
             let key = getch();
-            
-            if key == -1 {
+            if key == ERR {
                 continue;
-            } else if key == 113 || key == 81 {  // 'q' or 'Q'
+            }
+            if key_char(key) == Some('q') {
                 break;
-            } else {
-                match self.current_screen.as_str() {
-                    "main" => self.handle_main_input(key),
-                    "settings" => self.handle_settings_input(key),
-                    _ => {}
-                }
+            }
+            match self.screen {
+                Screen::Main => self.handle_main_input(key),
+                Screen::Settings => self.handle_settings_input(key),
             }
         }
     }
 }
 
-/// Tronca una stringa a `max_chars` caratteri rispettando i confini UTF-8.
-/// Evita i panic dello slicing per byte (`&s[..n]`) su caratteri multibyte.
-fn truncate_str(s: &str, max_chars: usize) -> String {
-    s.chars().take(max_chars).collect()
+/// btrbk output as shown on screen. Progress meters rewrite their line with
+/// '\r': such a line is transient and the next one takes its place.
+#[derive(Default)]
+struct OutputLog {
+    lines: Vec<String>,
+    last_is_transient: bool,
 }
 
-/// Ridisegna l'area di output mostrando le ultime `height` righe disponibili.
-/// Pulisce l'intera area prima di ridisegnare, evitando residui durante lo scroll.
-fn render_output_area(lines: &[String], start_y: i32, height: i32, width: i32) {
-    for row in 0..height {
-        mvaddstr(start_y + row, 0, &" ".repeat(width as usize));
-    }
-    let total = lines.len() as i32;
-    let first = if total > height { (total - height) as usize } else { 0 };
-    for (idx, line) in lines[first..].iter().enumerate() {
-        mvaddstr(start_y + idx as i32, 0, &truncate_str(line, width as usize));
-    }
-}
-
-/// First ssh:// target declared in a btrbk configuration.
-fn parse_target_url(conf: &str) -> Option<String> {
-    conf.lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            match (parts.next(), parts.next()) {
-                (Some("target"), Some(url)) if url.starts_with("ssh://") => Some(url.to_string()),
-                _ => None,
+impl OutputLog {
+    /// Adds a line; `transient` means it ended with '\r'. Returns whether
+    /// anything changed on screen.
+    fn push(&mut self, text: &str, transient: bool) -> bool {
+        let cleaned = clean_output_line(text);
+        if cleaned.trim().is_empty() {
+            // "\r\n": the newline makes the line before it permanent
+            if !transient {
+                self.last_is_transient = false;
             }
-        })
-        .next()
+            return false;
+        }
+        if self.last_is_transient {
+            self.lines.pop();
+        }
+        self.lines.push(cleaned);
+        self.last_is_transient = transient;
+        if self.lines.len() > MAX_OUTPUT_LINES {
+            self.lines.remove(0);
+        }
+        true
+    }
+}
+
+/// Reads a stream to its end, sending each line with a flag telling whether it
+/// ended with '\r' (a progress update) rather than '\n'.
+fn forward_stream(mut stream: impl Read, tx: &mpsc::Sender<(String, bool)>) {
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        for &byte in &chunk[..read] {
+            if byte == b'\n' || byte == b'\r' {
+                let text = String::from_utf8_lossy(&pending).into_owned();
+                pending.clear();
+                if tx.send((text, byte == b'\r')).is_err() {
+                    return;
+                }
+            } else {
+                pending.push(byte);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let _ = tx.send((String::from_utf8_lossy(&pending).into_owned(), false));
+    }
+}
+
+/// Strips ANSI escape sequences and control characters from a line of output.
+fn clean_output_line(line: &str) -> String {
+    let mut cleaned = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip entire ANSI sequence: ESC[ ... final_byte
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for nc in chars.by_ref() {
+                    if nc.is_ascii_alphabetic() || nc == '~' {
+                        break;
+                    }
+                }
+            }
+        } else if c == '\t' {
+            cleaned.push(' ');
+        } else if !c.is_control() {
+            cleaned.push(c);
+        }
+    }
+    cleaned
+}
+
+/// Splits "@home.20260803T0000" into subvolume name and timestamp. The
+/// timestamp never contains a dot, the subvolume name might.
+fn split_snapshot_name(name: &str) -> Option<(&str, &str)> {
+    let (prefix, timestamp) = name.rsplit_once('.')?;
+    (prefix.starts_with('@') && !timestamp.is_empty()).then_some((prefix, timestamp))
+}
+
+/// Groups snapshot names by subvolume: "@" first, then alphabetically, newest
+/// snapshot first inside each group. Names that are not snapshots are dropped.
+fn group_snapshots(names: impl Iterator<Item = String>) -> SnapshotGroups {
+    let mut groups: SnapshotGroups = Vec::new();
+    for name in names {
+        let Some((prefix, _)) = split_snapshot_name(&name) else {
+            continue;
+        };
+        match groups.iter_mut().find(|(existing, _)| existing == prefix) {
+            Some((_, snapshots)) => snapshots.push(name),
+            None => groups.push((prefix.to_string(), vec![name])),
+        }
+    }
+
+    for (_, snapshots) in &mut groups {
+        snapshots.sort_by(|a, b| b.cmp(a));
+    }
+    // "@" is a prefix of every other name, so plain ordering puts it first
+    groups.sort_by(|(a, _), (b, _)| a.cmp(b));
+    groups
+}
+
+/// Parses the timestamp btrbk puts in snapshot names, in any of its
+/// timestamp_format flavours (short, long, long-iso), with the optional "_N"
+/// suffix btrbk adds when a name is already taken.
+fn parse_btrbk_timestamp(timestamp: &str) -> Option<NaiveDateTime> {
+    // legacy "YYYYMMDD_HHMMSS" names: here the underscore is not a "_N" suffix
+    if let Ok(dt) = NaiveDateTime::parse_from_str(timestamp, "%Y%m%d_%H%M%S") {
+        return Some(dt);
+    }
+
+    let base = timestamp.split('_').next()?;
+    // long-iso carries a UTC offset: the name already is local time, drop it
+    let base = base.split(['+', '-']).next()?;
+
+    match base.len() {
+        8 => NaiveDate::parse_from_str(base, "%Y%m%d").ok()?.and_hms_opt(0, 0, 0),
+        13 => NaiveDateTime::parse_from_str(base, "%Y%m%dT%H%M").ok(),
+        15 => NaiveDateTime::parse_from_str(base, "%Y%m%dT%H%M%S").ok(),
+        _ => None,
+    }
+}
+
+/// Decides what a purge deletes. `groups` lists, per subvolume, its snapshots
+/// oldest first with their UUID (None when it could not be read).
+///
+/// The newest snapshot the target also holds is the parent for the next
+/// incremental send: it survives, together with everything newer. A subvolume
+/// with nothing in common with the target is skipped altogether — its chain is
+/// already broken, deleting more would only force a bigger full send.
+fn compute_purge_plan(
+    groups: &[PurgeCandidates],
+    target_uuids: &HashSet<String>,
+) -> PurgePlan {
+    let mut plan = PurgePlan::default();
+    for (prefix, snapshots) in groups {
+        if snapshots.len() <= 1 {
+            continue;
+        }
+        let keep_from = snapshots
+            .iter()
+            .rposition(|(_, uuid)| uuid.as_ref().is_some_and(|uuid| target_uuids.contains(uuid)));
+        match keep_from {
+            Some(keep_from) => {
+                plan.delete
+                    .extend(snapshots[..keep_from].iter().map(|(name, _)| name.clone()));
+            }
+            None => plan.skipped.push(prefix.clone()),
+        }
+    }
+    plan
+}
+
+/// First ssh:// target declared in a btrbk configuration, with the ssh options
+/// in effect where it is declared.
+fn parse_ssh_target(conf: &str) -> Option<SshTarget> {
+    let mut user = None;
+    let mut identity = None;
+    let mut port_option = None;
+
+    for line in conf.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(key), Some(value)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        // "no" and "default" are how btrbk.conf spells "unset"
+        let option = (value != "no" && value != "default").then(|| value.to_string());
+        match key {
+            "ssh_user" => user = option,
+            "ssh_identity" => identity = option,
+            "ssh_port" => port_option = option,
+            "target" => {
+                // both "target ssh://..." and "target send-receive ssh://..."
+                let url = if value.starts_with("ssh://") { Some(value) } else { parts.next() };
+                let Some(rest) = url.and_then(|url| url.strip_prefix("ssh://")) else {
+                    continue;
+                };
+                let (hostport, path) = rest.split_once('/')?;
+                // "[::1]:2222" — an IPv6 address has colons of its own
+                let (host, port) = match hostport.strip_prefix('[').and_then(|h| h.split_once(']')) {
+                    Some((host, after)) => (host, after.strip_prefix(':')),
+                    None => match hostport.split_once(':') {
+                        Some((host, port)) => (host, Some(port)),
+                        None => (hostport, None),
+                    },
+                };
+                if host.is_empty() {
+                    return None;
+                }
+                return Some(SshTarget {
+                    host: host.to_string(),
+                    port: port.map(str::to_string).or(port_option),
+                    path: format!("/{}", path),
+                    user,
+                    identity,
+                });
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// received_uuid values in the output of `btrfs subvolume list -u -R`.
-fn parse_received_uuids(output: &str) -> std::collections::HashSet<String> {
-    let mut uuids = std::collections::HashSet::new();
+fn parse_received_uuids(output: &str) -> HashSet<String> {
+    let mut uuids = HashSet::new();
     for line in output.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if let Some(index) = fields.iter().position(|f| *f == "received_uuid")
@@ -1302,47 +1420,52 @@ fn parse_subvolume_uuid(output: &str) -> Option<String> {
     })
 }
 
-/// First ssh:// target declared in btrbk.conf, if any.
-fn btrbk_target_url() -> Option<String> {
-    parse_target_url(&fs::read_to_string(BTRBK_CONF).ok()?)
-}
-
 /// received_uuid of every subvolume present on the backup target.
 ///
-/// Returns None when the target is not configured or not reachable: the caller
-/// must then refuse to purge, since it cannot tell which snapshot is still
-/// needed as parent for the next incremental send.
-fn target_received_uuids() -> Option<std::collections::HashSet<String>> {
-    let target = btrbk_target_url()?;
-    let rest = target.strip_prefix("ssh://")?;
-    let (hostport, path) = rest.split_once('/')?;
-    let (host, port) = match hostport.split_once(':') {
-        Some((h, p)) => (h, p),
-        None => (hostport, "22"),
-    };
+/// Fails when the target is not configured or not reachable: the caller must
+/// then refuse to purge, since it cannot tell which snapshot is still needed
+/// as parent for the next incremental send.
+fn target_received_uuids() -> Result<HashSet<String>, String> {
+    let conf = fs::read_to_string(BTRBK_CONF)
+        .map_err(|err| format!("cannot read {}: {}", BTRBK_CONF, err))?;
+    let target = parse_ssh_target(&conf)
+        .ok_or_else(|| format!("no ssh target in {}", BTRBK_CONF))?;
 
-    let output = Command::new("ssh")
-        .args([
-            "-p", port,
-            "-o", "ConnectTimeout=10",
-            "-o", "BatchMode=yes",
-            host,
-            &format!("sudo btrfs subvolume list -u -R '/{}'", path),
-        ])
+    let mut command = Command::new("ssh");
+    command.args(["-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]);
+    if let Some(port) = &target.port {
+        command.args(["-p", port]);
+    }
+    if let Some(user) = &target.user {
+        command.args(["-l", user]);
+    }
+    if let Some(identity) = &target.identity {
+        command.args(["-i", identity]);
+    }
+    let quoted_path = target.path.replace('\'', r"'\''");
+    let output = command
+        .arg(&target.host)
+        .arg(format!("sudo btrfs subvolume list -u -R '{}'", quoted_path))
+        .stdin(Stdio::null())
         .output()
-        .ok()?;
+        .map_err(|err| format!("cannot run ssh: {}", err))?;
 
     if !output.status.success() {
-        return None;
+        return Err(format!(
+            "backup target unreachable: {}",
+            last_line(&output.stderr).unwrap_or_else(|| "ssh failed".to_string())
+        ));
     }
 
-    Some(parse_received_uuids(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_received_uuids(&String::from_utf8_lossy(&output.stdout)))
 }
 
 /// UUID of a local subvolume, or None if it cannot be read.
-fn local_subvolume_uuid(path: &str) -> Option<String> {
+fn local_subvolume_uuid(path: &Path) -> Option<String> {
     let output = Command::new("btrfs")
-        .args(["subvolume", "show", path])
+        .args(["subvolume", "show"])
+        .arg(path)
+        .stdin(Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -1351,14 +1474,81 @@ fn local_subvolume_uuid(path: &str) -> Option<String> {
     parse_subvolume_uuid(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn run_command(cmd: &[&str]) -> bool {
-    Command::new(cmd[0])
+/// Last non-empty line of a command's output, cleaned for display.
+fn last_line(output: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .rev()
+        .map(clean_output_line)
+        .map(|line| line.trim().to_string())
+        .find(|line| !line.is_empty())
+}
+
+/// Runs a command silently. On failure the error is the last line it wrote to
+/// stderr, so the interface can say why.
+fn run_command(cmd: &[&str]) -> Result<(), String> {
+    let output = Command::new(cmd[0])
         .args(&cmd[1..])
-        .stdout(std::process::Stdio::null())  // Hide stdout
-        .stderr(std::process::Stdio::null())  // Hide stderr
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("cannot run {}: {}", cmd[0], err))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(last_line(&output.stderr).unwrap_or_else(|| format!("{} failed ({})", cmd[0], output.status)))
+    }
+}
+
+/// Lowercase ASCII letter for a key code, if it is one.
+fn key_char(key: i32) -> Option<char> {
+    u8::try_from(key)
+        .ok()
+        .filter(u8::is_ascii_alphabetic)
+        .map(|byte| byte.to_ascii_lowercase() as char)
+}
+
+/// Tronca una stringa a `max_chars` caratteri rispettando i confini UTF-8.
+/// Evita i panic dello slicing per byte (`&s[..n]`) su caratteri multibyte.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+/// Scrive `text` a (y, x) tagliandolo al bordo destro. Coordinate fuori dallo
+/// schermo vengono ignorate: nessun disegno può andare in panic o a capo,
+/// qualunque sia la dimensione del terminale.
+fn put(y: i32, x: i32, text: &str) {
+    let (height, width) = get_max_yx();
+    if y < 0 || x < 0 || y >= height || x >= width {
+        return;
+    }
+    mvaddstr(y, x, &truncate_str(text, (width - x) as usize));
+}
+
+fn put_centered(y: i32, text: &str) {
+    let (_, width) = get_max_yx();
+    put(y, ((width - text.chars().count() as i32) / 2).max(0), text);
+}
+
+fn put_separator(y: i32) {
+    let (_, width) = get_max_yx();
+    put(y, 0, &"-".repeat(width.max(0) as usize));
+}
+
+/// Ridisegna l'area di output mostrando le ultime `height` righe disponibili.
+/// Pulisce l'intera area prima di ridisegnare, evitando residui durante lo scroll.
+fn render_output_area(lines: &[String], start_y: i32, height: i32) {
+    let (_, width) = get_max_yx();
+    let blank = " ".repeat(width.max(0) as usize);
+    for row in 0..height {
+        put(start_y + row, 0, &blank);
+    }
+    let first = lines.len().saturating_sub(height.max(0) as usize);
+    for (idx, line) in lines[first..].iter().enumerate() {
+        put(start_y + idx as i32, 0, line);
+    }
 }
 
 fn get_max_yx() -> (i32, i32) {
@@ -1368,20 +1558,79 @@ fn get_max_yx() -> (i32, i32) {
     (max_y, max_x)
 }
 
+/// Prints what a purge would delete, without deleting anything.
+fn print_purge_plan() -> i32 {
+    let app = App::new();
+    match app.plan_purge() {
+        Ok(plan) => {
+            if plan.delete.is_empty() {
+                println!("Nothing to purge.");
+            }
+            for name in &plan.delete {
+                println!("would delete  {}", name);
+            }
+            for prefix in &plan.skipped {
+                println!("skipped       {} (no snapshot in common with the backup target)", prefix);
+            }
+            0
+        }
+        Err(reason) => {
+            eprintln!("Error: {}", reason);
+            1
+        }
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None | Some("--purge-plan") => {}
+        Some("--version" | "-V") => {
+            println!("btrbk_tui {}", VERSION);
+            return;
+        }
+        Some("--help" | "-h") => {
+            println!("btrbk_tui {} - restore Btrfs snapshots created with btrbk\n", VERSION);
+            println!("Usage: sudo btrbk_tui [OPTION]\n");
+            println!("  --purge-plan   show what Purge OLD would delete, then exit");
+            println!("  -V, --version  show the version");
+            println!("  -h, --help     show this help");
+            return;
+        }
+        Some(other) => {
+            eprintln!("Error: unknown option '{}' (try --help)", other);
+            std::process::exit(2);
+        }
+    }
+
     // Check for root privileges
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("Error: This tool requires root privileges.");
         eprintln!("Please run with sudo.");
         std::process::exit(1);
     }
-    
+
+    if !args.is_empty() {
+        std::process::exit(print_purge_plan());
+    }
+
+    // Un panic dentro curses lascerebbe il terminale inutilizzabile e il
+    // messaggio illeggibile: prima si esce da curses, poi si stampa
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        endwin();
+        default_hook(info);
+    }));
+
     // Initialize ncurses
+    setlocale(LcCategory::all, "");
     initscr();
     cbreak();
     noecho();
     keypad(stdscr(), true);
-    
+    // Senza questo ESC viene riconosciuto solo dopo un secondo
+    set_escdelay(25);
+
     // Create and run the TUI app
     let mut app = App::new();
     app.run();
@@ -1394,19 +1643,42 @@ fn main() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn target_url_is_the_first_ssh_target() {
-        let conf = "\
+    const CONF: &str = "\
 transaction_log            /var/log/btrbk.log
+ssh_identity /etc/btrbk/ssh/id_ed25519
 volume /mnt/btr_pool
   target ssh://10.0.0.1:2222/mnt/backup/host-btrfs
   subvolume @
+ssh_user backup
 ";
+
+    #[test]
+    fn ssh_target_is_the_first_one_with_the_options_before_it() {
         assert_eq!(
-            parse_target_url(conf).as_deref(),
-            Some("ssh://10.0.0.1:2222/mnt/backup/host-btrfs")
+            parse_ssh_target(CONF),
+            Some(SshTarget {
+                host: "10.0.0.1".to_string(),
+                port: Some("2222".to_string()),
+                path: "/mnt/backup/host-btrfs".to_string(),
+                // declared after the target: not in effect for it
+                user: None,
+                identity: Some("/etc/btrbk/ssh/id_ed25519".to_string()),
+            })
         );
-        assert_eq!(parse_target_url("volume /mnt/btr_pool\n  subvolume @\n"), None);
+        assert_eq!(parse_ssh_target("volume /mnt/btr_pool\n  subvolume @\n"), None);
+        assert_eq!(parse_ssh_target("target /mnt/local/backup\n"), None);
+    }
+
+    #[test]
+    fn ssh_target_handles_ports_ipv6_and_target_types() {
+        let target = parse_ssh_target("ssh_port 2200\ntarget send-receive ssh://nas.example/backup\n").unwrap();
+        assert_eq!((target.host.as_str(), target.port.as_deref()), ("nas.example", Some("2200")));
+
+        let target = parse_ssh_target("ssh_port default\ntarget ssh://[fd00::1]:2222/backup\n").unwrap();
+        assert_eq!((target.host.as_str(), target.port.as_deref()), ("fd00::1", Some("2222")));
+
+        let target = parse_ssh_target("ssh_identity no\ntarget ssh://[fd00::1]/backup\n").unwrap();
+        assert_eq!((target.port, target.identity), (None, None));
     }
 
     #[test]
@@ -1438,5 +1710,139 @@ ID 257 gen 1 top level 5 parent_uuid - received_uuid - uuid 0ed5ab3d-732e-4544-8
             Some("c9e62952-9e79-e041-acde-4dc9e3323826")
         );
         assert_eq!(parse_subvolume_uuid("no uuid here\n"), None);
+    }
+
+    #[test]
+    fn snapshot_names_split_at_the_last_dot() {
+        assert_eq!(split_snapshot_name("@home.20260803T0000"), Some(("@home", "20260803T0000")));
+        assert_eq!(split_snapshot_name("@.20260803T0000_1"), Some(("@", "20260803T0000_1")));
+        assert_eq!(split_snapshot_name("@my.data.20260803"), Some(("@my.data", "20260803")));
+        assert_eq!(split_snapshot_name("@home"), None);
+        assert_eq!(split_snapshot_name("@home."), None);
+        assert_eq!(split_snapshot_name("scripts.d"), None);
+    }
+
+    #[test]
+    fn groups_put_root_first_and_newest_on_top() {
+        let names = [
+            "@home.20260801T0000",
+            "@games.20260801T0000",
+            "@.20260801T0000",
+            "@home.20260803T0000",
+            "@home.20260802T0000",
+            "not_a_snapshot",
+            // a subvolume really called @root is its own group, never "@"
+            "@root.20260801T0000",
+        ];
+        let groups = group_snapshots(names.iter().map(|name| name.to_string()));
+        let prefixes: Vec<&str> = groups.iter().map(|(prefix, _)| prefix.as_str()).collect();
+        assert_eq!(prefixes, ["@", "@games", "@home", "@root"]);
+        assert_eq!(
+            groups[2].1,
+            ["@home.20260803T0000", "@home.20260802T0000", "@home.20260801T0000"]
+        );
+    }
+
+    #[test]
+    fn timestamps_in_every_btrbk_format() {
+        let at = |y, m, d, h, min, s| NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, s);
+        assert_eq!(parse_btrbk_timestamp("20260803"), at(2026, 8, 3, 0, 0, 0));
+        assert_eq!(parse_btrbk_timestamp("20260803T1405"), at(2026, 8, 3, 14, 5, 0));
+        assert_eq!(parse_btrbk_timestamp("20260803T1405_2"), at(2026, 8, 3, 14, 5, 0));
+        assert_eq!(parse_btrbk_timestamp("20260803T140559+0200"), at(2026, 8, 3, 14, 5, 59));
+        assert_eq!(parse_btrbk_timestamp("20260803T140559-0500_1"), at(2026, 8, 3, 14, 5, 59));
+        assert_eq!(parse_btrbk_timestamp("20260803_140559"), at(2026, 8, 3, 14, 5, 59));
+        assert_eq!(parse_btrbk_timestamp("BROKEN"), None);
+        assert_eq!(parse_btrbk_timestamp("20261399"), None);
+    }
+
+    fn group(prefix: &str, snapshots: &[(&str, Option<&str>)]) -> PurgeCandidates {
+        (
+            prefix.to_string(),
+            snapshots
+                .iter()
+                .map(|(name, uuid)| (name.to_string(), uuid.map(str::to_string)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn purge_keeps_the_parent_and_everything_newer() {
+        let target: HashSet<String> = ["u1", "u2"].iter().map(|u| u.to_string()).collect();
+        let groups = [group(
+            "@home",
+            &[
+                ("@home.1", Some("u0")),
+                ("@home.2", Some("u1")),
+                ("@home.3", Some("u2")), // newest one on the target: the parent
+                ("@home.4", Some("u3")),
+            ],
+        )];
+        let plan = compute_purge_plan(&groups, &target);
+        assert_eq!(plan.delete, ["@home.1", "@home.2"]);
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn purge_never_touches_a_broken_chain() {
+        let target: HashSet<String> = ["u9".to_string()].into_iter().collect();
+        let groups = [
+            // nothing in common with the target
+            group("@games", &[("@games.1", Some("u1")), ("@games.2", Some("u2"))]),
+            // uuid unreadable: treated as not on the target
+            group("@home", &[("@home.1", None), ("@home.2", None)]),
+            // the parent is the oldest: nothing precedes it
+            group("@", &[("@.1", Some("u9")), ("@.2", Some("u4"))]),
+            // a single snapshot is never a candidate
+            group("@log", &[("@log.1", Some("u5"))]),
+        ];
+        let plan = compute_purge_plan(&groups, &target);
+        assert!(plan.delete.is_empty());
+        assert_eq!(plan.skipped, ["@games", "@home"]);
+
+        assert_eq!(compute_purge_plan(&groups, &HashSet::new()).delete, Vec::<String>::new());
+    }
+
+    #[test]
+    fn output_lines_lose_ansi_and_control_characters() {
+        assert_eq!(clean_output_line("\x1b[1;32mdone\x1b[0m"), "done");
+        assert_eq!(clean_output_line("a\tb\x07c"), "a bc");
+        assert_eq!(clean_output_line("già fatto"), "già fatto");
+    }
+
+    #[test]
+    fn progress_updates_replace_each_other() {
+        let mut log = OutputLog::default();
+        log.push("Creating snapshot", false);
+        log.push("10MiB 0:00:01", true);
+        log.push("20MiB 0:00:02", true);
+        assert_eq!(log.lines, ["Creating snapshot", "20MiB 0:00:02"]);
+
+        // "\r\n" ends the meter: its last state stays on screen
+        assert!(!log.push("", false));
+        log.push("next subvolume", false);
+        assert_eq!(log.lines, ["Creating snapshot", "20MiB 0:00:02", "next subvolume"]);
+    }
+
+    #[test]
+    fn streams_are_split_on_both_line_endings() {
+        let (tx, rx) = mpsc::channel();
+        forward_stream(&b"one\ntwo\rthree\r\nlast"[..], &tx);
+        drop(tx);
+        let received: Vec<(String, bool)> = rx.iter().collect();
+        let expected = [("one", false), ("two", true), ("three", true), ("", false), ("last", false)];
+        assert_eq!(received.len(), expected.len());
+        for ((text, transient), (want_text, want_transient)) in received.iter().zip(expected) {
+            assert_eq!((text.as_str(), *transient), (want_text, want_transient));
+        }
+    }
+
+    #[test]
+    fn key_char_folds_case_and_ignores_special_keys() {
+        assert_eq!(key_char('S' as i32), Some('s'));
+        assert_eq!(key_char('q' as i32), Some('q'));
+        assert_eq!(key_char(KEY_UP), None);
+        assert_eq!(key_char(ERR), None);
+        assert_eq!(key_char('1' as i32), None);
     }
 }

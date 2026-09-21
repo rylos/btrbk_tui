@@ -7,11 +7,19 @@ A professional terminal user interface for restoring Btrfs snapshots created wit
 import contextlib
 import curses
 import json
+import locale
 import os
+import re
+import select
+import signal
 import subprocess
 import sys
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+VERSION = "2.8.0"
 
 # Configuration file path
 CONFIG_FILE = Path.home() / ".config" / "btrbk_tui" / "config.json"
@@ -28,6 +36,279 @@ DEFAULT_CONFIG = {
     "show_timestamps": True,
     "theme": "default"
 }
+
+# Settings screen entries, in display order
+SETTINGS = [
+    ("BTR Pool Directory", "btr_pool_dir"),
+    ("Snapshots Directory", "snapshots_dir"),
+    ("Auto Cleanup .BROKEN", "auto_cleanup"),
+    ("Confirm Actions", "confirm_actions"),
+    ("Show Timestamps", "show_timestamps"),
+]
+
+KEY_ESC = 27
+ENTER_KEYS = (curses.KEY_ENTER, 10, 13)
+BACKSPACE_KEYS = (curses.KEY_BACKSPACE, 127, 8)
+
+# How long status messages stay on screen, in seconds
+STATUS_SHORT = 3
+STATUS_MEDIUM = 5
+STATUS_LONG = 10
+STATUS_RESULT = 15
+STATUS_CRITICAL = 60
+
+# Lines of btrbk output kept in memory while creating snapshots
+MAX_OUTPUT_LINES = 1000
+
+ANSI_SEQUENCE = re.compile(r"\x1b\[[^A-Za-z~]*[A-Za-z~]?|\x1b")
+
+
+# --- pure helpers (covered by tests/parsing_test.py) -------------------------
+
+def clean_output_line(line: str) -> str:
+    """Strip ANSI escape sequences and control characters from a line of output."""
+    line = ANSI_SEQUENCE.sub("", line).replace("\t", " ")
+    return "".join(c for c in line if c.isprintable())
+
+
+def split_snapshot_name(name: str) -> tuple[str, str] | None:
+    """Split "@home.20260803T0000" into subvolume name and timestamp.
+
+    The timestamp never contains a dot, the subvolume name might.
+    """
+    prefix, dot, timestamp = name.rpartition(".")
+    if not dot or not prefix.startswith("@") or not timestamp:
+        return None
+    return prefix, timestamp
+
+
+def group_snapshots(names) -> list[tuple[str, list[str]]]:
+    """Group snapshot names by subvolume.
+
+    "@" comes first, then alphabetically; inside a group the newest snapshot is
+    first. Names that are not snapshots are dropped.
+    """
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        parts = split_snapshot_name(name)
+        if parts:
+            groups.setdefault(parts[0], []).append(name)
+    # "@" is a prefix of every other name, so plain ordering puts it first
+    return [(prefix, sorted(groups[prefix], reverse=True)) for prefix in sorted(groups)]
+
+
+def parse_btrbk_timestamp(timestamp: str) -> datetime | None:
+    """Parse the timestamp btrbk puts in snapshot names.
+
+    Understands every timestamp_format flavour (short, long, long-iso) and the
+    "_N" suffix btrbk adds when a name is already taken.
+    """
+    # legacy "YYYYMMDD_HHMMSS" names: here the underscore is not a "_N" suffix
+    with contextlib.suppress(ValueError):
+        return datetime.strptime(timestamp, "%Y%m%d_%H%M%S")
+
+    # drop the "_N" suffix, then the UTC offset long-iso carries: the name
+    # already is local time
+    base = re.split(r"[_+-]", timestamp, maxsplit=1)[0]
+
+    formats = {8: "%Y%m%d", 13: "%Y%m%dT%H%M", 15: "%Y%m%dT%H%M%S"}
+    fmt = formats.get(len(base))
+    if fmt is None:
+        return None
+    try:
+        return datetime.strptime(base, fmt)
+    except ValueError:
+        return None
+
+
+@dataclass
+class PurgePlan:
+    """What a purge would delete, computed before touching anything."""
+
+    delete: list[str] = field(default_factory=list)   # snapshot names, oldest first
+    skipped: list[str] = field(default_factory=list)  # subvolumes sharing nothing with the target
+
+
+def compute_purge_plan(groups, target_uuids: set[str]) -> PurgePlan:
+    """Decide what a purge deletes.
+
+    `groups` lists, per subvolume, its snapshots oldest first as (name, uuid),
+    uuid being None when it could not be read.
+
+    The newest snapshot the target also holds is the parent for the next
+    incremental send: it survives, together with everything newer. A subvolume
+    with nothing in common with the target is skipped altogether — its chain is
+    already broken, deleting more would only force a bigger full send.
+    """
+    plan = PurgePlan()
+    for prefix, snapshots in groups:
+        if len(snapshots) <= 1:
+            continue
+        keep_from = None
+        for index, (_, uuid) in enumerate(snapshots):
+            if uuid and uuid in target_uuids:
+                keep_from = index
+        if keep_from is None:
+            plan.skipped.append(prefix)
+        else:
+            plan.delete.extend(name for name, _ in snapshots[:keep_from])
+    return plan
+
+
+@dataclass
+class SshTarget:
+    """Where btrbk sends its backups, as far as ssh is concerned."""
+
+    host: str
+    path: str
+    port: str | None = None
+    user: str | None = None
+    identity: str | None = None
+
+
+def parse_ssh_target(conf: str) -> SshTarget | None:
+    """First ssh:// target of a btrbk configuration, with the ssh options in effect there."""
+    options: dict[str, str | None] = {"ssh_user": None, "ssh_identity": None, "ssh_port": None}
+
+    for line in conf.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        key, value = parts[0], parts[1]
+        if key in options:
+            # "no" and "default" are how btrbk.conf spells "unset"
+            options[key] = None if value in {"no", "default"} else value
+            continue
+        if key != "target":
+            continue
+
+        # both "target ssh://..." and "target send-receive ssh://..."
+        url = value if value.startswith("ssh://") else (parts[2] if len(parts) > 2 else "")
+        if not url.startswith("ssh://"):
+            continue
+        hostport, slash, path = url[len("ssh://"):].partition("/")
+        if not slash:
+            return None
+
+        # "[::1]:2222" — an IPv6 address has colons of its own
+        if hostport.startswith("[") and "]" in hostport:
+            host, _, after = hostport[1:].partition("]")
+            port = after[1:] if after.startswith(":") else None
+        else:
+            host, colon, port = hostport.partition(":")
+            port = port if colon else None
+        if not host:
+            return None
+
+        return SshTarget(host=host, path=f"/{path}", port=port or options["ssh_port"],
+                         user=options["ssh_user"], identity=options["ssh_identity"])
+    return None
+
+
+def parse_received_uuids(output: str) -> set[str]:
+    """received_uuid values in the output of `btrfs subvolume list -u -R`."""
+    uuids = set()
+    for line in output.splitlines():
+        parts = line.split()
+        if "received_uuid" in parts:
+            idx = parts.index("received_uuid")
+            if idx + 1 < len(parts) and parts[idx + 1] != "-":
+                uuids.add(parts[idx + 1])
+    return uuids
+
+
+def parse_subvolume_uuid(output: str) -> str | None:
+    """UUID in the output of `btrfs subvolume show`."""
+    for line in output.splitlines():
+        stripped = line.strip()
+        # plain "UUID:" only — "Parent UUID:" and "Received UUID:" must not match
+        if stripped.startswith("UUID:"):
+            fields = stripped.split()
+            if len(fields) >= 2:
+                return fields[1]
+    return None
+
+
+class OutputLog:
+    """btrbk output as shown on screen.
+
+    Progress meters rewrite their line with '\\r': such a line is transient and
+    the next one takes its place.
+    """
+
+    def __init__(self):
+        self.lines: list[str] = []
+        self.last_is_transient = False
+
+    def push(self, text: str, transient: bool) -> bool:
+        """Add a line; `transient` means it ended with '\\r'. Returns whether the screen changed."""
+        cleaned = clean_output_line(text)
+        if not cleaned.strip():
+            # "\r\n": the newline makes the line before it permanent
+            if not transient:
+                self.last_is_transient = False
+            return False
+        if self.last_is_transient:
+            self.lines.pop()
+        self.lines.append(cleaned)
+        self.last_is_transient = transient
+        del self.lines[:-MAX_OUTPUT_LINES]
+        return True
+
+
+class StreamSplitter:
+    """Splits a byte stream into lines on both '\\n' and '\\r'."""
+
+    def __init__(self):
+        self.pending = b""
+
+    def feed(self, data: bytes) -> list[tuple[str, bool]]:
+        """Return the (text, ended_with_cr) lines completed by `data`."""
+        lines = []
+        for byte in data:
+            if byte in (10, 13):
+                lines.append((self.pending.decode("utf-8", "replace"), byte == 13))
+                self.pending = b""
+            else:
+                self.pending += bytes([byte])
+        return lines
+
+    def flush(self) -> list[tuple[str, bool]]:
+        """Return whatever is left when the stream ends without a line ending."""
+        if not self.pending:
+            return []
+        rest, self.pending = self.pending, b""
+        return [(rest.decode("utf-8", "replace"), False)]
+
+
+def last_line(output: bytes | str) -> str | None:
+    """Last non-empty line of a command's output, cleaned for display."""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    for line in reversed(output.splitlines()):
+        cleaned = clean_output_line(line).strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+def run_command(cmd: list[str]) -> str | None:
+    """Run a command silently.
+
+    Returns None on success; on failure the last line it wrote to stderr, so
+    the interface can say why.
+    """
+    try:
+        result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE)
+    except OSError as err:
+        return f"cannot run {cmd[0]}: {err}"
+    if result.returncode == 0:
+        return None
+    return last_line(result.stderr) or f"{cmd[0]} failed (exit {result.returncode})"
+
+
+# --- configuration ------------------------------------------------------------
 
 class Config:
     """Configuration manager for the application."""
@@ -71,234 +352,191 @@ class Config:
             return True
         return False
 
+
+# --- snapshot operations ------------------------------------------------------
+
+class PurgeError(Exception):
+    """The purge cannot be planned: nothing must be deleted."""
+
+
 class SnapshotManager:
     """Manager for snapshot operations."""
 
     def __init__(self, config: Config):
         self.config = config
 
-    def get_snapshots(self) -> tuple[dict[str, list[str]], list[str]]:
-        """Get available snapshots organized by type (dynamically detected)."""
+    def _snapshot_names(self) -> list[str]:
         snapshots_dir = self.config.get("snapshots_dir")
+        return [name for name in os.listdir(snapshots_dir)
+                if os.path.isdir(os.path.join(snapshots_dir, name))]
+
+    def get_snapshots(self) -> list[tuple[str, list[str]]]:
+        """Get available snapshots grouped by subvolume (dynamically detected)."""
         try:
-            folders = [f for f in os.listdir(snapshots_dir)
-                      if os.path.isdir(os.path.join(snapshots_dir, f))]
-
-            # Group snapshots by prefix
-            snapshot_groups = {}
-            for folder in folders:
-                if '.' in folder and folder.startswith('@'):
-                    prefix = folder.split('.')[0]
-                    if prefix not in snapshot_groups:
-                        snapshot_groups[prefix] = []
-                    snapshot_groups[prefix].append(folder)
-
-            # Sort each group by timestamp (newest first)
-            for snapshots in snapshot_groups.values():
-                snapshots.sort(reverse=True)
-
-            # Sort prefixes for consistent ordering (@ first, then alphabetically)
-            sorted_prefixes = sorted(snapshot_groups.keys(), key=lambda x: (x != '@', x))
-
-            return snapshot_groups, sorted_prefixes
-        except Exception:
-            return {}, []
+            return group_snapshots(self._snapshot_names())
+        except OSError:
+            return []
 
     def format_snapshot_name(self, snapshot: str) -> str:
         """Format snapshot name for display."""
-        if not self.config.get("show_timestamps", True):
-            return snapshot
+        if self.config.get("show_timestamps", True):
+            parts = split_snapshot_name(snapshot)
+            dt = parse_btrbk_timestamp(parts[1]) if parts else None
+            if dt:
+                return f"{snapshot} ({dt.strftime('%Y-%m-%d %H:%M:%S')})"
+        return snapshot
 
-        # Extract timestamp from snapshot name
-        try:
-            if '.' in snapshot and snapshot.startswith('@'):
-                # Find the prefix and extract timestamp
-                prefix = snapshot.split('.', maxsplit=1)[0]
-                timestamp_str = snapshot[len(prefix) + 1:]  # +1 for the dot
+    def restore_snapshot(self, snapshot: str, subvol_name: str) -> tuple[str, str]:
+        """Replace the subvolume `subvol_name` with a writable snapshot of `snapshot`.
 
-                # Try multiple timestamp formats
-                try:
-                    dt = datetime.strptime(timestamp_str, "%Y%m%dT%H%M")
-                    return f"{snapshot} ({dt.strftime('%Y-%m-%d %H:%M:%S')})"
-                except ValueError:
-                    try:
-                        dt = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
-                        return f"{snapshot} ({dt.strftime('%Y-%m-%d %H:%M:%S')})"
-                    except ValueError:
-                        return snapshot
-            else:
-                return snapshot
-        except (ValueError, IndexError):
-            return snapshot
+        `subvol_name` is the snapshot prefix as-is ("@", "@home", "@root", ...):
+        deriving it from a type name would map a subvolume called @root onto @.
 
-    def restore_snapshot(self, snapshot: str, snapshot_type: str) -> str:
-        """Restore a snapshot with verification and rollback.
-
-        Returns:
+        Returns (outcome, reason), outcome being one of:
             "success"         - restore completato e verificato
             "failed"          - restore fallito ma rollback riuscito (stato precedente ripristinato)
             "rollback_failed" - restore fallito E rollback fallito (stato incoerente, .BROKEN conservato)
         """
         btr_pool_dir = self.config.get("btr_pool_dir")
-        snapshots_dir = self.config.get("snapshots_dir")
-
-        source_path = os.path.join(snapshots_dir, snapshot)
+        source_path = os.path.join(self.config.get("snapshots_dir"), snapshot)
 
         # Pre-check: lo snapshot sorgente deve esistere prima di toccare il subvolume corrente
         if not os.path.exists(source_path):
-            return "failed"
-
-        # Dynamic subvolume path generation
-        subvol_name = "@" if snapshot_type in {"root", ""} else f"@{snapshot_type}"
+            return "failed", f"{source_path} no longer exists"
 
         current_subvol = os.path.join(btr_pool_dir, subvol_name)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         broken_subvol = os.path.join(btr_pool_dir, f"{subvol_name}.BROKEN.{timestamp}")
-        new_subvol = current_subvol
 
         current_existed = os.path.exists(current_subvol)
 
-        # Guardia: se il subvolume corrente esiste, deve essere un vero subvolume btrfs
-        # prima di spostarlo (evita di spostare una directory normale per errore)
         if current_existed:
-            show = subprocess.run(["btrfs", "subvolume", "show", current_subvol],
-                                  capture_output=True)
-            if show.returncode != 0:
-                return "failed"
+            # Guardia: deve essere un vero subvolume btrfs prima di spostarlo
+            # (evita di spostare una directory normale per errore)
+            reason = run_command(["btrfs", "subvolume", "show", current_subvol])
+            if reason:
+                return "failed", f"{current_subvol} is not a btrfs subvolume: {reason}"
 
-            # Move current subvolume to .BROKEN
-            mv = subprocess.run(["mv", current_subvol, broken_subvol], capture_output=True)
-            if mv.returncode != 0:
-                return "failed"
+            # rename(2) would silently replace an empty directory
+            if os.path.exists(broken_subvol):
+                return "failed", f"{broken_subvol} already exists"
+
+            # Move current to .BROKEN. rename(2) e non mv: tra filesystem
+            # diversi fallisce, invece di mettersi a copiare un subvolume
+            try:
+                os.rename(current_subvol, broken_subvol)
+            except OSError as err:
+                return "failed", f"cannot move {subvol_name}: {err}"
+
+        def roll_back(reason: str) -> tuple[str, str]:
+            """Rimette al suo posto il subvolume originale."""
+            if current_existed:
+                try:
+                    os.rename(broken_subvol, current_subvol)
+                except OSError as err:
+                    return "rollback_failed", f"{reason}; original kept as {broken_subvol} ({err})"
+            return "failed", reason
 
         # Create new snapshot
-        snap = subprocess.run(["btrfs", "subvolume", "snapshot", source_path, new_subvol],
-                              capture_output=True)
-        if snap.returncode != 0:
-            # Rollback: restore original
-            if current_existed:
-                rb = subprocess.run(["mv", broken_subvol, current_subvol], capture_output=True)
-                if rb.returncode != 0:
-                    return "rollback_failed"
-            return "failed"
+        reason = run_command(["btrfs", "subvolume", "snapshot", source_path, current_subvol])
+        if reason:
+            return roll_back(f"snapshot failed: {reason}")
 
         # Verify restore success
-        if not self._verify_restore_success(new_subvol, snapshot_type):
-            # Rollback: delete failed subvol, restore original
-            dele = subprocess.run(["btrfs", "subvolume", "delete", new_subvol], capture_output=True)
-            if dele.returncode != 0:
+        reason = self._verify_restore_success(current_subvol, subvol_name)
+        if reason:
+            # Rollback completo: rimuovi il subvolume fallito e ripristina l'originale
+            err = run_command(["btrfs", "subvolume", "delete", current_subvol])
+            if err:
                 # Il subvolume fallito occupa ancora il path: impossibile ripristinare l'originale
-                return "rollback_failed"
-            if current_existed:
-                rb = subprocess.run(["mv", broken_subvol, current_subvol], capture_output=True)
-                if rb.returncode != 0:
-                    return "rollback_failed"
-            return "failed"
+                return "rollback_failed", (f"{reason}; cannot remove the failed restore ({err}), "
+                                           f"original kept as {broken_subvol}")
+            return roll_back(reason)
 
         # Auto cleanup if enabled (solo se avevamo un originale da rimuovere)
         if self.config.get("auto_cleanup", False) and current_existed:
-            subprocess.run(["btrfs", "subvolume", "delete", broken_subvol], capture_output=True)
+            run_command(["btrfs", "subvolume", "delete", broken_subvol])
 
-        return "success"
+        return "success", ""
 
-    def _verify_restore_success(self, restored_subvol: str, snapshot_type: str) -> bool:
-        """Verify restored subvolume integrity."""
+    def _verify_restore_success(self, restored_subvol: str, subvol_name: str) -> str | None:
+        """Verify restored subvolume integrity. Returns None when fine, else the reason."""
         if not os.path.exists(restored_subvol):
-            return False
+            return "restored subvolume is missing"
 
         # Verify it's a valid btrfs subvolume
-        result = subprocess.run(["btrfs", "subvolume", "show", restored_subvol],
-                              capture_output=True)
-        if result.returncode != 0:
-            return False
+        reason = run_command(["btrfs", "subvolume", "show", restored_subvol])
+        if reason:
+            return f"restored path is not a subvolume: {reason}"
 
-        if snapshot_type == "root":
-            for d in ["etc", "usr", "var", "bin"]:
-                if not os.path.exists(os.path.join(restored_subvol, d)):
-                    return False
-            for f in ["etc/fstab", "etc/passwd"]:
-                p = os.path.join(restored_subvol, f)
-                if not os.path.isfile(p):
-                    return False
-        elif snapshot_type == "home":
-            try:
-                if not os.listdir(restored_subvol):
-                    return False
-            except OSError:
-                return False
-        else:
-            # Any other type: just verify readable
-            try:
-                os.listdir(restored_subvol)
-            except OSError:
-                return False
-
-        return True
-
-    def _get_target_url(self) -> str | None:
-        """First ssh:// target declared in btrbk.conf, if any."""
         try:
-            with open(BTRBK_CONF) as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[0] == "target" and parts[1].startswith("ssh://"):
-                        return parts[1]
-        except OSError:
-            pass
+            if subvol_name == "@":
+                for d in ["etc", "usr", "var", "bin"]:
+                    if not os.path.exists(os.path.join(restored_subvol, d)):
+                        return f"restored root has no /{d}"
+                for f in ["etc/fstab", "etc/passwd"]:
+                    if not os.path.isfile(os.path.join(restored_subvol, f)):
+                        return f"restored root has no /{f}"
+            elif subvol_name == "@home":
+                if not os.listdir(restored_subvol):
+                    return "restored home is empty"
+            else:
+                # Any other subvolume: just verify readable
+                os.listdir(restored_subvol)
+        except OSError as err:
+            return f"restored subvolume is unreadable: {err}"
+
         return None
 
-    def get_target_received_uuids(self) -> set[str] | None:
+    def get_target_received_uuids(self) -> set[str]:
         """received_uuid of every subvolume present on the backup target.
 
-        Returns None when the target is not configured or not reachable. The
-        caller must then refuse to purge: without knowing what the target
+        Raises PurgeError when the target is not configured or not reachable.
+        The caller must then refuse to purge: without knowing what the target
         holds, there is no way to tell which snapshot is still needed as
         parent for the next incremental send.
         """
-        target = self._get_target_url()
-        if not target:
-            return None
+        try:
+            conf = Path(BTRBK_CONF).read_text()
+        except OSError as err:
+            raise PurgeError(f"cannot read {BTRBK_CONF}: {err}") from err
+        target = parse_ssh_target(conf)
+        if target is None:
+            raise PurgeError(f"no ssh target in {BTRBK_CONF}")
 
-        rest = target[len("ssh://"):]
-        hostport, _, path = rest.partition('/')
-        host, _, port = hostport.partition(':')
+        command = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
+        if target.port:
+            command += ["-p", target.port]
+        if target.user:
+            command += ["-l", target.user]
+        if target.identity:
+            command += ["-i", target.identity]
+        quoted_path = target.path.replace("'", "'\\''")
+        command += [target.host, f"sudo btrfs subvolume list -u -R '{quoted_path}'"]
 
         try:
-            result = subprocess.run(
-                ["ssh", "-p", port or "22",
-                 "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host,
-                 f"sudo btrfs subvolume list -u -R '/{path}'"],
-                capture_output=True, text=True, timeout=60, check=True)
-        except (subprocess.SubprocessError, OSError):
-            return None
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                    text=True, timeout=60)
+        except (subprocess.SubprocessError, OSError) as err:
+            raise PurgeError(f"backup target unreachable: {err}") from err
+        if result.returncode != 0:
+            raise PurgeError(f"backup target unreachable: {last_line(result.stderr) or 'ssh failed'}")
 
-        uuids = set()
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if "received_uuid" in parts:
-                idx = parts.index("received_uuid")
-                if idx + 1 < len(parts) and parts[idx + 1] != "-":
-                    uuids.add(parts[idx + 1])
-        return uuids
+        return parse_received_uuids(result.stdout)
 
     def get_local_uuid(self, snapshot_path: str) -> str | None:
         """UUID of a local subvolume, or None if it cannot be read."""
         try:
             result = subprocess.run(["btrfs", "subvolume", "show", snapshot_path],
-                                    capture_output=True, text=True, check=True)
-        except (subprocess.SubprocessError, OSError):
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        except OSError:
             return None
-        for line in result.stdout.splitlines():
-            stripped = line.strip()
-            # plain "UUID:" only — "Parent UUID:" and "Received UUID:" must not match
-            if stripped.startswith("UUID:"):
-                fields = stripped.split()
-                if len(fields) >= 2:
-                    return fields[1]
-        return None
+        if result.returncode != 0:
+            return None
+        return parse_subvolume_uuid(result.stdout)
 
-    def purge_old_snapshots(self) -> tuple[int, list[str]]:
-        """Purge old snapshots, keeping the ones still needed by the target.
+    def plan_purge(self) -> PurgePlan:
+        """Work out which old snapshots can go, keeping the ones the target still needs.
 
         btrbk does not protect snapshots that serve as parent for incremental
         backups (see btrbk.conf(5)), so deleting the newest snapshot the target
@@ -306,113 +544,72 @@ class SnapshotManager:
         that means hours of transfer. We therefore keep the newest snapshot
         present on the target *and* everything after it.
 
-        Returns (-2, []) when the target cannot be queried, (-1, []) on error.
+        Raises PurgeError when the target cannot be queried.
         """
-        snapshots_dir = self.config.get("snapshots_dir")
-
         target_uuids = self.get_target_received_uuids()
-        if target_uuids is None:
-            return -2, []
-
+        snapshots_dir = self.config.get("snapshots_dir")
         try:
-            all_snapshots = []
-            for item in os.listdir(snapshots_dir):
-                item_path = os.path.join(snapshots_dir, item)
-                if os.path.isdir(item_path) and item.startswith('@') and '.' in item:
-                    all_snapshots.append(item_path)
+            names = self._snapshot_names()
+        except OSError as err:
+            raise PurgeError(f"cannot read snapshots directory: {err}") from err
 
-            if not all_snapshots:
-                return 0, []
+        groups = [
+            (prefix, [(name, self.get_local_uuid(os.path.join(snapshots_dir, name)))
+                      for name in reversed(snapshots)])  # oldest first
+            for prefix, snapshots in group_snapshots(names)
+        ]
+        return compute_purge_plan(groups, target_uuids)
 
-            # Sort snapshots
-            all_snapshots.sort()
+    def execute_purge(self, plan: PurgePlan) -> tuple[int, int]:
+        """Delete the planned snapshots. Returns (deleted, failed)."""
+        snapshots_dir = self.config.get("snapshots_dir")
+        deleted = sum(
+            run_command(["btrfs", "subvolume", "delete", os.path.join(snapshots_dir, name)]) is None
+            for name in plan.delete
+        )
+        return deleted, len(plan.delete) - deleted
 
-            # Get all unique prefixes dynamically
-            prefixes = set()
-            for snapshot_path in all_snapshots:
-                basename = os.path.basename(snapshot_path)
-                if '.' in basename:
-                    prefix = basename.split('.')[0]
-                    if prefix.startswith('@'):
-                        prefixes.add(prefix)
-
-            # Find old snapshots to delete for each prefix
-            to_delete = []
-            for prefix in prefixes:
-                type_snapshots = [s for s in all_snapshots
-                                if os.path.basename(s).startswith(f"{prefix}.")]
-
-                if len(type_snapshots) <= 1:
-                    continue
-
-                # newest local snapshot the target also holds: it is the parent
-                # for the next incremental send and must survive, together with
-                # everything newer than it
-                keep_from = -1
-                for index, snapshot_path in enumerate(type_snapshots):
-                    uuid = self.get_local_uuid(snapshot_path)
-                    if uuid and uuid in target_uuids:
-                        keep_from = index
-
-                if keep_from < 0:
-                    # nothing in common with the target: the chain is already
-                    # broken, deleting more would only force a bigger full send
-                    continue
-
-                to_delete.extend(type_snapshots[:keep_from])
-
-            if not to_delete:
-                return 0, []
-
-            # Delete old snapshots
-            deleted_count = 0
-            deleted_names = []
-            for snapshot_path in to_delete:
-                try:
-                    subprocess.run(["btrfs", "subvolume", "delete", snapshot_path],
-                                 check=True, capture_output=True, text=True)
-                    deleted_count += 1
-                    deleted_names.append(os.path.basename(snapshot_path))
-                except subprocess.CalledProcessError:
-                    continue  # Continue with other deletions even if one fails
-
-            return deleted_count, deleted_names
-
-        except Exception:
-            return -1, []  # Error occurred
-
-    def clean_broken_subvolumes(self) -> tuple[int, list[str]]:
-        """Clean all .BROKEN subvolumes."""
+    def clean_broken_subvolumes(self) -> tuple[int, int]:
+        """Delete every .BROKEN subvolume in the pool. Returns (deleted, failed); raises OSError."""
         btr_pool_dir = self.config.get("btr_pool_dir")
+        broken = [os.path.join(btr_pool_dir, item) for item in os.listdir(btr_pool_dir)
+                  if ".BROKEN" in item and os.path.isdir(os.path.join(btr_pool_dir, item))]
+        deleted = sum(run_command(["btrfs", "subvolume", "delete", path]) is None for path in broken)
+        return deleted, len(broken) - deleted
 
-        try:
-            broken_subvolumes = []
 
-            # Find all .BROKEN subvolumes
-            for item in os.listdir(btr_pool_dir):
-                item_path = os.path.join(btr_pool_dir, item)
-                if os.path.isdir(item_path) and ".BROKEN" in item:
-                    broken_subvolumes.append(item_path)
+# --- user interface -----------------------------------------------------------
 
-            if not broken_subvolumes:
-                return 0, []
+def put(stdscr, y: int, x: int, text: str, attr: int = 0):
+    """Write `text` at (y, x), clipped at the right edge.
 
-            # Delete .BROKEN subvolumes
-            deleted_count = 0
-            deleted_names = []
-            for subvol_path in broken_subvolumes:
-                try:
-                    subprocess.run(["btrfs", "subvolume", "delete", subvol_path],
-                                 check=True, capture_output=True, text=True)
-                    deleted_count += 1
-                    deleted_names.append(os.path.basename(subvol_path))
-                except subprocess.CalledProcessError:
-                    continue  # Continue with other deletions even if one fails
+    Off-screen coordinates are ignored: no drawing can raise or wrap, whatever
+    the terminal size.
+    """
+    height, width = stdscr.getmaxyx()
+    if y < 0 or x < 0 or y >= height or x >= width:
+        return
+    # curses raises after writing the bottom-right cell, though the cell is drawn
+    with contextlib.suppress(curses.error):
+        stdscr.addstr(y, x, text[:width - x], attr)
 
-            return deleted_count, deleted_names
 
-        except Exception:
-            return -1, []  # Error occurred
+def put_centered(stdscr, y: int, text: str, attr: int = 0):
+    _, width = stdscr.getmaxyx()
+    put(stdscr, y, max(0, (width - len(text)) // 2), text, attr)
+
+
+def put_separator(stdscr, y: int):
+    _, width = stdscr.getmaxyx()
+    put(stdscr, y, 0, "-" * width)
+
+
+def key_char(key: int) -> str | None:
+    """Lowercase ASCII letter for a key code, if it is one."""
+    if 0 <= key < 128 and chr(key).isalpha():
+        return chr(key).lower()
+    return None
+
 
 class TUIApp:
     """Main TUI application."""
@@ -422,15 +619,15 @@ class TUIApp:
         self.snapshot_manager = SnapshotManager(self.config)
         self.current_screen = "main"
         self.selected_row = 0
-        self.selected_col = 0  # 0=root, 1=home, 2=games
+        self.selected_col = 0
         self.status_message = ""
-        self.status_timeout = 0
+        self.status_until = 0.0
         self.reboot_needed = False  # Track if reboot is needed
         # Cache degli snapshot: evita di rileggere il filesystem ad ogni frame.
         # None = cache invalidata (verrà ricalcolata al prossimo accesso).
-        self._snapshot_cache: tuple[dict[str, list[str]], list[str]] | None = None
+        self._snapshot_cache: list[tuple[str, list[str]]] | None = None
 
-    def get_snapshots_cached(self) -> tuple[dict[str, list[str]], list[str]]:
+    def get_snapshots_cached(self) -> list[tuple[str, list[str]]]:
         """Restituisce gli snapshot dalla cache, ricalcolandoli solo se invalidata."""
         if self._snapshot_cache is None:
             self._snapshot_cache = self.snapshot_manager.get_snapshots()
@@ -453,395 +650,255 @@ class TUIApp:
         curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLACK)  # Status bar
         curses.init_pair(6, curses.COLOR_CYAN, -1)                   # Info
 
+    def set_status(self, message: str, seconds: float = STATUS_SHORT):
+        """Set status message, shown for `seconds`."""
+        self.status_message = message
+        self.status_until = time.monotonic() + seconds
+
+    def show_busy(self, stdscr, message: str):
+        """Show a message right away, before an operation that blocks the interface.
+
+        set_status alone is not enough: the message would only be drawn on the
+        next frame, that is once the operation is already over.
+        """
+        self.set_status(message)
+        self.draw_screen(stdscr)
+        stdscr.refresh()
+
     def draw_header(self, stdscr):
         """Draw application header."""
         _, width = stdscr.getmaxyx()
-
-        # Title bar
-        title = "BTRBK TUI v2.7"
-        try:
-            stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
-            stdscr.addstr(0, 0, title.center(width)[:width-1])
-            stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
-        except curses.error:
-            pass
-
-        # Separator - no color, full width
-        with contextlib.suppress(curses.error):
-            stdscr.addstr(1, 0, "-" * width)
+        put(stdscr, 0, 0, f"BTRBK TUI v{VERSION}".center(width), curses.color_pair(5) | curses.A_BOLD)
+        put_separator(stdscr, 1)
 
     def draw_footer(self, stdscr):
         """Draw application footer with key bindings."""
-        height, width = stdscr.getmaxyx()
+        height, _ = stdscr.getmaxyx()
 
-        # Key bindings - show H: Reboot when needed
-        if self.reboot_needed:
+        if self.current_screen == "main":
             keys = [
-                "Up/Down: Navigate", "Left/Right: Switch", "ENTER: Select",
-                "S: Settings", "R: Refresh", "I: Snapshot", "P: Purge OLD", "B: Clean BROKEN", "H: REBOOT", "Q: Quit"
+                "Up/Down: Navigate", "Left/Right: Switch", "ENTER: Restore",
+                "S: Settings", "R: Refresh", "I: Snapshot", "P: Purge OLD", "B: Clean BROKEN",
             ]
+            if self.reboot_needed:
+                keys.append("H: REBOOT")
+            keys.append("Q: Quit")
+            footer_text = " | ".join(keys)
         else:
-            keys = [
-                "Up/Down: Navigate", "Left/Right: Switch", "ENTER: Select",
-                "S: Settings", "R: Refresh", "I: Snapshot", "P: Purge OLD", "B: Clean BROKEN", "Q: Quit"
-            ]
-        footer_text = " | ".join(keys)
+            footer_text = "Up/Down: Navigate | ENTER: Edit | SPACE: Toggle | S: Save | ESC: Back | Q: Quit"
 
-        try:
-            # Separator - no color, full width
-            stdscr.addstr(height - 2, 0, "-" * width)
-            # Footer text with color
-            stdscr.attron(curses.color_pair(5))
-            stdscr.addstr(height - 1, 0, footer_text[:width-1].ljust(width-1))
-            stdscr.attroff(curses.color_pair(5))
-        except curses.error:
-            pass
+        put_separator(stdscr, height - 2)
+        put(stdscr, height - 1, 0, footer_text, curses.color_pair(5))
 
     def draw_status(self, stdscr):
         """Draw status message if any."""
-        height, width = stdscr.getmaxyx()
+        height, _ = stdscr.getmaxyx()
 
-        # Show temporary status messages first (if active)
-        if self.status_message and self.status_timeout > 0:
-            try:
-                stdscr.attron(curses.color_pair(6))
-                stdscr.addstr(height - 3, 0, self.status_message[:width-1].ljust(width-1))
-                stdscr.attroff(curses.color_pair(6))
-            except curses.error:
-                pass
-            self.status_timeout -= 1
-        elif self.status_timeout <= 0:
-            self.status_message = ""
-            # Show reboot warning only when no temporary messages are active
-            if self.reboot_needed:
-                try:
-                    stdscr.attron(curses.color_pair(4) | curses.A_BOLD)  # Yellow/Warning color
-                    warning_msg = "⚠ REBOOT REQUIRED - Press H to reboot system ⚠"
-                    stdscr.addstr(height - 3, 0, warning_msg[:width-1].ljust(width-1))
-                    stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-                except curses.error:
-                    pass
-        elif self.reboot_needed and not self.status_message:
-            # Show reboot warning when no temporary messages
-            try:
-                stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-                warning_msg = "⚠ REBOOT REQUIRED - Press H to reboot system ⚠"
-                stdscr.addstr(height - 3, 0, warning_msg[:width-1].ljust(width-1))
-                stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-            except curses.error:
-                pass
+        if self.status_message and time.monotonic() < self.status_until:
+            put(stdscr, height - 3, 0, self.status_message, curses.color_pair(6))
+            return
 
-    def set_status(self, message: str, timeout: int = 30):
-        """Set status message with timeout."""
-        self.status_message = message
-        self.status_timeout = timeout
+        self.status_message = ""
+        # Show reboot warning only when no temporary messages are active
+        if self.reboot_needed:
+            put(stdscr, height - 3, 0, "WARNING: REBOOT REQUIRED - Press H to reboot system",
+                curses.color_pair(4) | curses.A_BOLD)
 
-    def create_snapshot(self, stdscr):
-        """Create new snapshots using btrbk run --progress."""
-        height, width = stdscr.getmaxyx()
+    def clamp_selection(self, groups):
+        """Bring the selection back within bounds.
 
-        # Clear screen and show header
-        stdscr.clear()
-        self.draw_header(stdscr)
-
-        # Show operation title
-        title = "Creating Snapshots with btrbk..."
-        stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
-        stdscr.addstr(4, (width - len(title)) // 2, title)
-        stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
-
-        # Show instructions
-        instruction = "Press ESC to cancel or wait for completion"
-        stdscr.attron(curses.A_DIM)
-        stdscr.addstr(6, (width - len(instruction)) // 2, instruction)
-        stdscr.attroff(curses.A_DIM)
-
-        # Simple output area - only horizontal borders
-        output_start_y = 8
-        output_height = height - 12
-
-        # Draw simple horizontal borders
-        border = "-" * width
-        stdscr.addstr(output_start_y - 1, 0, border)
-        stdscr.addstr(output_start_y + output_height, 0, border)
-
-        stdscr.refresh()
-
-        # Set non-blocking input
-        stdscr.nodelay(True)
-
-        try:
-            # Start btrbk process
-            process = subprocess.Popen(
-                ["btrbk", "run", "--progress"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # Merge stderr into stdout
-                universal_newlines=True,
-                bufsize=1
-            )
-
-            output_lines = []
-            current_line = 0
-
-            while True:
-                # Check for ESC key
-                key = stdscr.getch()
-                if key == 27:  # ESC
-                    process.terminate()
-                    process.wait()
-                    return False, "Operation cancelled by user"
-
-                # Read output from process
-                line = process.stdout.readline()
-                if line:
-                    line = line.rstrip()
-                    if line:  # Only add non-empty lines
-                        output_lines.append(line)
-
-                        # Display the line in the output area
-                        display_y = output_start_y + len(output_lines) - 1 - current_line
-                        if display_y >= output_start_y and display_y < output_start_y + output_height:
-                            # Truncate line if too long
-                            display_line = line[:width] if len(line) > width else line
-                            stdscr.addstr(display_y, 0, " " * width)  # Clear line (full width)
-                            stdscr.addstr(display_y, 0, display_line)
-
-                        # Auto-scroll if needed
-                        if len(output_lines) > output_height:
-                            current_line = len(output_lines) - output_height
-
-                        stdscr.refresh()
-
-                # Check if process finished
-                if process.poll() is not None:
-                    break
-
-                # Small delay to prevent high CPU usage
-                curses.napms(50)
-
-            # Get final return code
-            return_code = process.returncode
-
-            # Show completion message
-            if return_code == 0:
-                completion_msg = "✓ Snapshots created successfully! Press any key to continue..."
-                stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
-            else:
-                completion_msg = "✗ Error creating snapshots! Press any key to continue..."
-                stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-
-            stdscr.addstr(height - 2, (width - len(completion_msg)) // 2, completion_msg)
-            stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
-            stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-            stdscr.refresh()
-
-            # Wait for key press
-            stdscr.nodelay(False)
-            stdscr.getch()
-
-            return return_code == 0, f"btrbk completed with return code {return_code}"
-
-        except FileNotFoundError:
-            return False, "btrbk command not found"
-        except Exception as e:
-            return False, f"Error running btrbk: {e!s}"
-        finally:
-            # Restore normal input mode
-            stdscr.nodelay(False)
-
-    def purge_old_snapshots(self) -> tuple[int, list[str]]:
-        """Purge old snapshots using SnapshotManager."""
-        return self.snapshot_manager.purge_old_snapshots()
-
-    def clean_broken_subvolumes(self) -> tuple[int, list[str]]:
-        """Clean .BROKEN subvolumes using SnapshotManager."""
-        return self.snapshot_manager.clean_broken_subvolumes()
+        Lists change after refresh, purge and restore, and a selection past
+        the end of a list would be invisible.
+        """
+        self.selected_col = max(0, min(self.selected_col, len(groups) - 1))
+        rows = len(groups[self.selected_col][1]) if groups else 0
+        self.selected_row = max(0, min(self.selected_row, rows - 1))
 
     def draw_main_screen(self, stdscr):
         """Draw main snapshot selection screen with dynamic columns."""
         height, width = stdscr.getmaxyx()
-
-        snapshot_groups, sorted_prefixes = self.get_snapshots_cached()
-
-        if not snapshot_groups:
-            try:
-                stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-                stdscr.addstr(height // 2, (width - 20) // 2, "No snapshots found!")
-                stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-            except curses.error:
-                pass
-            return
-
-        # Ensure selected_col is within bounds
-        if self.selected_col >= len(sorted_prefixes):
-            self.selected_col = len(sorted_prefixes) - 1
-
-        # Calculate column positions dynamically
-        num_cols = len(sorted_prefixes)
-        col_width = (width - 4) // num_cols if num_cols > 0 else width - 4
-        start_y = 4
-
-        # Draw column headers
-        try:
-            stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
-            for i, prefix in enumerate(sorted_prefixes):
-                col_x = 2 + i * col_width
-                snapshots_count = len(snapshot_groups.get(prefix, []))
-                header = f"{prefix.upper()} ({snapshots_count})"
-                stdscr.addstr(start_y - 1, col_x, header[:col_width-2])
-            stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
-        except curses.error:
-            pass
-
-        # Draw snapshots for each column
-        max_display = height - 8  # Leave space for header/footer
-
-        for col_idx, prefix in enumerate(sorted_prefixes):
-            snapshots = snapshot_groups.get(prefix, [])
-            col_x = 2 + col_idx * col_width
-
-            # Ensure selected_row is within bounds for current column
-            if col_idx == self.selected_col and self.selected_row >= len(snapshots):
-                self.selected_row = max(0, len(snapshots) - 1)
-
-            for i, snapshot in enumerate(snapshots[:max_display]):
-                if start_y + i >= height - 4:
-                    break
-
-                y = start_y + i
-                display_name = self.snapshot_manager.format_snapshot_name(snapshot)
-
-                try:
-                    if self.selected_col == col_idx and i == self.selected_row:
-                        stdscr.attron(curses.color_pair(1))
-                        stdscr.addstr(y, col_x, display_name[:col_width-2])
-                        stdscr.attroff(curses.color_pair(1))
-                    else:
-                        stdscr.addstr(y, col_x, display_name[:col_width-2])
-                except curses.error:
-                    pass
+        groups = self.get_snapshots_cached()
 
         # Show current configuration
         config_info = f"Pool: {self.config.get('btr_pool_dir')} | Snapshots: {self.config.get('snapshots_dir')}"
-        try:
-            stdscr.attron(curses.A_DIM)
-            stdscr.addstr(2, 2, config_info[:width-4])
-            stdscr.attroff(curses.A_DIM)
-        except curses.error:
-            pass
+        put(stdscr, 2, 2, config_info, curses.A_DIM)
+
+        if not groups:
+            put_centered(stdscr, height // 2, "No snapshots found!", curses.color_pair(4) | curses.A_BOLD)
+            put_centered(stdscr, height // 2 + 1, "S: check the paths | I: create snapshots", curses.A_DIM)
+            return
+
+        self.clamp_selection(groups)
+
+        # Calculate column positions dynamically
+        col_width = max(1, (width - 4) // len(groups))
+        text_width = max(1, col_width - 2)
+        start_y = 4
+        # Rows from start_y down to the line above the status bar; the row in
+        # between is kept for the "more below" indicator
+        visible = max(1, height - 4 - start_y - 1)
+
+        for col_idx, (prefix, snapshots) in enumerate(groups):
+            col_x = 2 + col_idx * col_width
+            header = f"{prefix.upper()} ({len(snapshots)})"
+            put(stdscr, start_y - 1, col_x, header[:text_width], curses.color_pair(2) | curses.A_BOLD)
+
+            # Only the selected column scrolls, just enough to keep the cursor visible
+            first = max(0, self.selected_row + 1 - visible) if col_idx == self.selected_col else 0
+
+            for row in range(first, min(first + visible, len(snapshots))):
+                display_name = self.snapshot_manager.format_snapshot_name(snapshots[row])
+                selected = col_idx == self.selected_col and row == self.selected_row
+                put(stdscr, start_y + row - first, col_x, display_name[:text_width],
+                    curses.color_pair(1) if selected else 0)
+
+            if len(snapshots) > visible:
+                last = min(first + visible, len(snapshots))
+                position = f"[{first + 1}-{last} of {len(snapshots)}]"
+                put(stdscr, start_y + visible, col_x, position[:text_width], curses.A_DIM)
 
     def draw_settings_screen(self, stdscr):
         """Draw settings configuration screen."""
-        height, width = stdscr.getmaxyx()
-
-        settings = [
-            ("BTR Pool Directory", "btr_pool_dir"),
-            ("Snapshots Directory", "snapshots_dir"),
-            ("Auto Cleanup .BROKEN", "auto_cleanup"),
-            ("Confirm Actions", "confirm_actions"),
-            ("Show Timestamps", "show_timestamps")
-        ]
-
+        height, _ = stdscr.getmaxyx()
         start_y = 4
 
-        try:
-            stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
-            stdscr.addstr(start_y - 1, 4, "SETTINGS")
-            stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
-        except curses.error:
-            pass
+        put(stdscr, start_y - 1, 4, "SETTINGS", curses.color_pair(2) | curses.A_BOLD)
 
-        for i, (label, key) in enumerate(settings):
-            if start_y + i * 2 >= height - 8:  # Don't write too close to bottom
+        for i, (label, key) in enumerate(SETTINGS):
+            y = start_y + i * 2
+            if y >= height - 6:  # Don't write too close to bottom
                 break
 
-            y = start_y + i * 2
             value = self.config.get(key)
-
-            try:
-                if i == self.selected_row:
-                    stdscr.attron(curses.color_pair(1))
-
-                stdscr.addstr(y, 4, f"{label}:"[:width-6])
-
-                if isinstance(value, bool):
-                    value_str = "Yes" if value else "No"
-                else:
-                    value_str = str(value)
-
-                stdscr.addstr(y + 1, 6, value_str[:width-8])
-
-                if i == self.selected_row:
-                    stdscr.attroff(curses.color_pair(1))
-            except curses.error:
-                pass
+            value_str = ("Yes" if value else "No") if isinstance(value, bool) else str(value)
+            attr = curses.color_pair(1) if i == self.selected_row else 0
+            put(stdscr, y, 4, f"{label}:", attr)
+            put(stdscr, y + 1, 6, value_str, attr)
 
         # Show config file path and status
+        config_exists = "EXISTS" if CONFIG_FILE.exists() else "NOT FOUND"
+        put(stdscr, height - 5, 4, f"Config: {CONFIG_FILE} ({config_exists})", curses.A_DIM)
+
+    def draw_screen(self, stdscr):
+        """Draw the whole interface."""
+        # erase() and not clear(): clear() forces a full terminal repaint on
+        # every refresh, which means flicker on every frame
+        stdscr.erase()
+        self.draw_header(stdscr)
+        if self.current_screen == "main":
+            self.draw_main_screen(stdscr)
+        else:
+            self.draw_settings_screen(stdscr)
+        self.draw_status(stdscr)
+        self.draw_footer(stdscr)
+
+    def create_snapshot(self, stdscr) -> str | None:
+        """Run `btrbk run --progress`, streaming its output. Returns None on success, else the reason."""
+        height, _ = stdscr.getmaxyx()
+
+        stdscr.erase()
+        self.draw_header(stdscr)
+        put_centered(stdscr, 4, "Creating Snapshots with btrbk...", curses.color_pair(2) | curses.A_BOLD)
+        put_centered(stdscr, 6, "Press ESC to cancel or wait for completion", curses.A_DIM)
+
+        # Simple output area - only horizontal borders
+        output_start_y = 8
+        output_height = max(1, height - 12)
+        put_separator(stdscr, output_start_y - 1)
+        put_separator(stdscr, output_start_y + output_height)
+        stdscr.refresh()
+
         try:
-            stdscr.attron(curses.A_DIM)
-            config_path = f"Config: {CONFIG_FILE}"
-            config_exists = "EXISTS" if CONFIG_FILE.exists() else "NOT FOUND"
-            stdscr.addstr(height - 7, 4, f"{config_path} ({config_exists})"[:width-6])
-            stdscr.addstr(height - 6, 4, "ENTER: Edit | SPACE: Toggle | ESC: Back | S: Save"[:width-6])
-            stdscr.attroff(curses.A_DIM)
-        except curses.error:
-            pass
+            # Own session: no controlling terminal, so a stray ssh password
+            # prompt fails instead of scribbling over the curses screen, and
+            # the whole process tree (btrfs send, ssh, pv) can be signalled at
+            # once on cancel.
+            process = subprocess.Popen(["btrbk", "run", "--progress"], stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       start_new_session=True)
+        except OSError as err:
+            return f"cannot run btrbk: {err}"
 
-    def edit_setting(self, stdscr, key: str):
-        """Edit a configuration setting."""
-        current_value = self.config.get(key)
+        streams = {process.stdout.fileno(): StreamSplitter(), process.stderr.fileno(): StreamSplitter()}
+        log = OutputLog()
+        cancelled_at = exited_at = None
+        killed = False
 
-        if isinstance(current_value, bool):
-            # Toggle boolean values
-            self.config.set(key, not current_value)
-            self.config.save()  # Auto-save after change
-            self.set_status(f"Toggled {key}")
-            return
-
-        # Edit string values
-        height, width = stdscr.getmaxyx()
-
-        # Create edit window
-        dialog_width = min(60, width - 8)
-        dialog_height = 5
-
+        stdscr.timeout(50)
         try:
-            edit_win = curses.newwin(dialog_height, dialog_width, height // 2 - 2, (width - dialog_width) // 2)
-            edit_win.box()
-            edit_win.addstr(0, 2, f" Edit {key} "[:dialog_width-4])
+            while True:
+                if stdscr.getch() == KEY_ESC and cancelled_at is None:
+                    # SIGINT to the whole group is what Ctrl-C does in a shell,
+                    # the case btrbk is written for: it aborts and logs the
+                    # transaction.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGINT)
+                    cancelled_at = time.monotonic()
+                    put_centered(stdscr, height - 2, "Cancelling, waiting for btrbk to stop...",
+                                 curses.color_pair(4) | curses.A_BOLD)
+                    stdscr.refresh()
 
-            # Show current value
-            current_str = str(current_value)[:dialog_width-4]
-            edit_win.addstr(2, 2, f"Current: {current_str}")
-            edit_win.addstr(3, 2, "New: ")
-            edit_win.refresh()
+                if cancelled_at and not killed and time.monotonic() - cancelled_at > 5:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    killed = True
 
-            # Simple text input
-            curses.curs_set(1)
-            curses.echo()
+                dirty = False
+                readable = select.select(list(streams), [], [], 0)[0] if streams else []
+                for fd in readable:
+                    data = os.read(fd, 65536)
+                    lines = streams[fd].feed(data) if data else streams.pop(fd).flush()
+                    for text, transient in lines:
+                        dirty |= log.push(text, transient)
+                if dirty:
+                    self.render_output_area(stdscr, log.lines, output_start_y, output_height)
+                    stdscr.refresh()
 
-            try:
-                new_value = edit_win.getstr(3, 7, dialog_width - 10).decode('utf-8')
-                if new_value.strip():
-                    cleaned = new_value.strip()
-                    self.config.set(key, cleaned)
-                    self.config.save()  # Auto-save after change
-                    self.invalidate_snapshots()
-                    # Avvisa se un path di directory non esiste
-                    if key in ("btr_pool_dir", "snapshots_dir") and not os.path.isdir(cleaned):
-                        self.set_status(f"Updated {key} (WARNING: path does not exist)")
-                    else:
-                        self.set_status(f"Updated {key}")
-                else:
-                    self.set_status("No changes made")
-            except Exception:
-                self.set_status("Edit cancelled")
+                # Leave only once btrbk is gone, so the SIGKILL escalation above
+                # stays armed. If something still holds the pipes open after it
+                # exited, do not wait for it forever.
+                if exited_at is None and process.poll() is not None:
+                    exited_at = time.monotonic()
+                if exited_at and (not streams or (not dirty and time.monotonic() - exited_at > 0.5)):
+                    break
+        finally:
+            stdscr.timeout(100)
+            process.stdout.close()
+            process.stderr.close()
 
-            curses.noecho()
-            curses.curs_set(0)
+        succeeded = process.wait() == 0
 
-        except curses.error:
-            self.set_status("Cannot create edit dialog")
+        if cancelled_at:
+            # btrbk has cleaned up and gone: whatever ignored SIGINT must not
+            # outlive the cancel as an orphan running as root
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            return "cancelled by user"
+
+        # ASCII only: under pkexec the locale is C and glyphs would be garbled
+        if succeeded:
+            put_centered(stdscr, height - 2, "[OK] Snapshots created successfully! Press any key to continue...",
+                         curses.color_pair(3) | curses.A_BOLD)
+        else:
+            put_centered(stdscr, height - 2, "[FAILED] Error creating snapshots! Press any key to continue...",
+                         curses.color_pair(4) | curses.A_BOLD)
+        stdscr.refresh()
+
+        stdscr.timeout(-1)
+        stdscr.getch()
+        stdscr.timeout(100)
+
+        if succeeded:
+            return None
+        return log.lines[-1] if log.lines else "btrbk exited with an error"
+
+    def render_output_area(self, stdscr, lines: list[str], start_y: int, height: int):
+        """Redraw the output area with the last `height` lines, clearing leftovers first."""
+        _, width = stdscr.getmaxyx()
+        for row in range(height):
+            put(stdscr, start_y + row, 0, " " * width)
+        for idx, line in enumerate(lines[-height:]):
+            put(stdscr, start_y + idx, 0, line)
 
     def confirm_dialog(self, stdscr, message: str) -> bool:
         """Show confirmation dialog."""
@@ -849,190 +906,274 @@ class TUIApp:
             return True
 
         height, width = stdscr.getmaxyx()
-
-        # Create dialog window
-        dialog_width = min(len(message) + 10, width - 4)
+        hint = "Y: Yes | N: No"
+        dialog_width = max(8, min(max(len(message), len(hint)) + 6, width - 4))
         dialog_height = 5
+        dialog_y = height // 2 - 2
+        dialog_x = max(0, (width - dialog_width) // 2)
+        inner = dialog_width - 2
 
+        border = f"+{'-' * inner}+"
+        put(stdscr, dialog_y, dialog_x, border, curses.A_BOLD)
+        for i in range(1, dialog_height - 1):
+            put(stdscr, dialog_y + i, dialog_x, f"|{' ' * inner}|", curses.A_BOLD)
+        put(stdscr, dialog_y + dialog_height - 1, dialog_x, border, curses.A_BOLD)
+        put(stdscr, dialog_y + 1, dialog_x + 3, message[:max(0, inner - 4)])
+        put(stdscr, dialog_y + 3, dialog_x + 3, hint[:max(0, inner - 4)])
+        stdscr.refresh()
+
+        stdscr.timeout(-1)
         try:
-            dialog_win = curses.newwin(dialog_height, dialog_width,
-                                     height // 2 - 2, (width - dialog_width) // 2)
-
-            dialog_win.box()
-            dialog_win.addstr(1, 2, message[:dialog_width - 4])
-            dialog_win.addstr(3, 2, "Y: Yes | N: No")
-            dialog_win.refresh()
-
             while True:
-                key = dialog_win.getch()
-                if key in [ord('y'), ord('Y')]:
+                key = stdscr.getch()
+                if key_char(key) == "y":
                     return True
-                if key in [ord('n'), ord('N'), 27]:  # 27 = ESC
+                if key == KEY_ESC or key_char(key) == "n":
                     return False
-        except curses.error:
-            # If dialog fails, default to confirmation
-            return True
+        finally:
+            stdscr.timeout(100)
+
+    def edit_setting(self, stdscr, key: str):
+        """Edit a configuration setting."""
+        current_value = self.config.get(key)
+
+        if isinstance(current_value, bool):
+            self.toggle_setting(key)
+            return
+
+        height, width = stdscr.getmaxyx()
+
+        # Clear area for input
+        for i in range(5):
+            put(stdscr, height // 2 - 2 + i, 4, " " * max(0, width - 8))
+
+        input_y = height // 2 + 1
+        input_x = 9
+        input_width = max(1, width - input_x - 4)
+        put(stdscr, height // 2 - 1, 4, f"Edit {key}: ")
+        put(stdscr, height // 2, 4, f"Current: {current_value}")
+        put(stdscr, input_y, 4, "New: ")
+        put(stdscr, height // 2 + 3, 4, "Press ENTER to confirm, ESC to cancel")
+
+        curses.curs_set(1)
+        stdscr.timeout(-1)
+        text = ""
+        try:
+            while True:
+                # When the text does not fit, show its tail: where the typing happens
+                tail = text[-input_width:]
+                put(stdscr, input_y, input_x, " " * input_width)
+                put(stdscr, input_y, input_x, tail)
+                with contextlib.suppress(curses.error):
+                    stdscr.move(input_y, input_x + len(tail))
+                stdscr.refresh()
+
+                ch = stdscr.getch()
+                if ch in ENTER_KEYS:
+                    confirmed = True
+                    break
+                if ch == KEY_ESC:
+                    confirmed = False
+                    break
+                if ch in BACKSPACE_KEYS:
+                    text = text[:-1]
+                elif 32 <= ch < 127:
+                    text += chr(ch)
+        finally:
+            stdscr.timeout(100)
+            curses.curs_set(0)
+
+        new_path = text.strip()
+        if not confirmed or not new_path:
+            self.set_status("Edit cancelled")
+            return
+
+        self.config.set(key, new_path)
+        self.invalidate_snapshots()
+        if not self.config.save():
+            self.set_status(f"Updated {key} but could NOT save the config file", STATUS_LONG)
+        elif os.path.isdir(new_path):
+            self.set_status(f"Updated {key}", STATUS_MEDIUM)
+        else:
+            # Avvisa se un path di directory non esiste
+            self.set_status(f"Updated {key} (WARNING: path does not exist)", STATUS_LONG)
+
+    def toggle_setting(self, key: str):
+        """Toggle a boolean setting and save."""
+        value = self.config.get(key)
+        if not isinstance(value, bool):
+            return
+        self.config.set(key, not value)
+        label = next(label for label, name in SETTINGS if name == key)
+        state = "No" if value else "Yes"
+        if self.config.save():
+            self.set_status(f"{label}: {state}", STATUS_MEDIUM)
+        else:
+            self.set_status(f"{label}: {state} (could NOT save the config file)", STATUS_LONG)
 
     def handle_main_input(self, stdscr, key):
         """Handle input for main screen with dynamic columns."""
-        snapshot_groups, sorted_prefixes = self.get_snapshots_cached()
+        groups = self.get_snapshots_cached()
+        self.clamp_selection(groups)
 
-        if not sorted_prefixes:
-            return
-
-        # Ensure selected_col is within bounds
-        if self.selected_col >= len(sorted_prefixes):
-            self.selected_col = len(sorted_prefixes) - 1
-
-        current_snapshots = snapshot_groups.get(sorted_prefixes[self.selected_col], [])
-
-        if key == curses.KEY_UP and self.selected_row > 0:
+        if key == curses.KEY_UP:
             self.selected_row -= 1
         elif key == curses.KEY_DOWN:
-            if self.selected_row < len(current_snapshots) - 1:
-                self.selected_row += 1
+            self.selected_row += 1
         elif key == curses.KEY_LEFT:
-            if self.selected_col > 0:
-                self.selected_col -= 1
-                # Adjust row if new column has fewer items
-                new_snapshots = snapshot_groups.get(sorted_prefixes[self.selected_col], [])
-                self.selected_row = min(self.selected_row, len(new_snapshots) - 1) if new_snapshots else 0
+            self.selected_col -= 1
         elif key == curses.KEY_RIGHT:
-            if self.selected_col < len(sorted_prefixes) - 1:
-                self.selected_col += 1
-                # Adjust row if new column has fewer items
-                new_snapshots = snapshot_groups.get(sorted_prefixes[self.selected_col], [])
-                self.selected_row = min(self.selected_row, len(new_snapshots) - 1) if new_snapshots else 0
-        elif key in [curses.KEY_ENTER, 10, 13]:
-            self.handle_snapshot_selection(stdscr, snapshot_groups, sorted_prefixes)
-        elif key in [ord('s'), ord('S')]:
-            self.current_screen = "settings"
+            self.selected_col += 1
+        elif key == curses.KEY_HOME:
             self.selected_row = 0
-        elif key in [ord('r'), ord('R')]:
-            # Invalidate cache and force re-read from filesystem
-            self.invalidate_snapshots()
-            self.set_status("Refreshed snapshot list")
-        elif key in [ord('h'), ord('H')]:
-            # Reboot if needed
-            if self.reboot_needed:
-                if self.confirm_dialog(stdscr, "Reboot system now?"):
-                    subprocess.run(["sync"], capture_output=True)
-                    subprocess.run(["reboot"], capture_output=True)
-                else:
-                    self.set_status("Reboot cancelled")
-            else:
-                self.set_status("No reboot needed")
-        elif key in [ord('p'), ord('P')]:
-            if self.confirm_dialog(stdscr, "Purge old snapshots (keeps what the backup target still needs)?"):
-                # querying the target over ssh takes a moment: say so before blocking
-                self.set_status("Checking backup target, then purging...", 30)
-                stdscr.refresh()
+        elif key == curses.KEY_END:
+            self.selected_row = sys.maxsize
+        elif key in ENTER_KEYS:
+            self.handle_snapshot_selection(stdscr, groups)
+            return
+        else:
+            action = {
+                "s": self.open_settings,
+                "r": self.handle_refresh,
+                "h": self.handle_reboot,
+                "p": self.handle_purge,
+                "b": self.handle_clean_broken,
+                "i": self.handle_create_snapshot,
+            }.get(key_char(key))
+            if action:
+                action(stdscr)
+            return
+        self.clamp_selection(groups)
 
-                deleted_count, _ = self.purge_old_snapshots()
-                self.invalidate_snapshots()
+    def open_settings(self, _stdscr):
+        self.current_screen = "settings"
+        self.selected_row = 0
 
-                if deleted_count == -2:
-                    self.set_status("Backup target unreachable: nothing purged (chain left intact)", 150)
-                elif deleted_count == -1:
-                    self.set_status("Error: cannot read snapshots directory", 100)
-                elif deleted_count == 0:
-                    self.set_status("No old snapshots to purge", 50)
-                else:
-                    self.set_status(f"Purged {deleted_count} old snapshots successfully", 150)
-            else:
-                self.set_status("Purge cancelled")
-        elif key in [ord('b'), ord('B')]:
-            if self.confirm_dialog(stdscr, "Delete all .BROKEN subvolumes?"):
-                self.set_status("Cleaning .BROKEN subvolumes...", 30)
-                stdscr.refresh()
+    def handle_refresh(self, _stdscr):
+        # Invalidate cache and force re-read from filesystem
+        self.invalidate_snapshots()
+        self.set_status("Snapshots refreshed")
 
-                deleted_count, _ = self.clean_broken_subvolumes()
-                self.invalidate_snapshots()
+    def handle_reboot(self, stdscr):
+        if not self.reboot_needed:
+            self.set_status("No reboot needed")
+        elif self.confirm_dialog(stdscr, "Reboot system now?"):
+            run_command(["sync"])
+            reason = run_command(["reboot"])
+            if reason:
+                self.set_status(f"Error: reboot failed: {reason}", STATUS_LONG)
+        else:
+            self.set_status("Reboot cancelled")
 
-                if deleted_count == -1:
-                    self.set_status("Error: cannot read pool directory", 100)
-                elif deleted_count == 0:
-                    self.set_status("No .BROKEN subvolumes found", 50)
-                else:
-                    self.set_status(f"Cleaned {deleted_count} .BROKEN subvolumes successfully", 150)
-            else:
-                self.set_status("Clean cancelled")
-        elif key in [ord('i'), ord('I')]:
-            if self.confirm_dialog(stdscr, "Create new snapshots with btrbk?"):
-                success, message = self.create_snapshot(stdscr)
-                if success:
-                    self.invalidate_snapshots()
-                    self.set_status("Snapshots created successfully", 100)
-                else:
-                    self.set_status(f"Snapshot creation failed: {message}", 150)
-            else:
-                self.set_status("Snapshot creation cancelled")
+    def handle_purge(self, stdscr):
+        # querying the target over ssh takes a moment: say so before blocking
+        self.show_busy(stdscr, "Checking backup target...")
 
-    def handle_snapshot_selection(self, stdscr, snapshot_groups, sorted_prefixes):
+        try:
+            plan = self.snapshot_manager.plan_purge()
+        except PurgeError as err:
+            self.set_status(f"Nothing purged (chain left intact): {err}", STATUS_RESULT)
+            return
+
+        skipped = f" ({', '.join(plan.skipped)} skipped: not on the backup target)" if plan.skipped else ""
+
+        if not plan.delete:
+            self.set_status(f"No old snapshots to purge{skipped}", STATUS_LONG)
+            return
+
+        self.draw_screen(stdscr)
+        if not self.confirm_dialog(stdscr, f"Delete {len(plan.delete)} old snapshots? The backup chain is kept."):
+            self.set_status("Purge cancelled")
+            return
+
+        self.show_busy(stdscr, "Purging old snapshots...")
+        deleted, failed = self.snapshot_manager.execute_purge(plan)
+        self.invalidate_snapshots()
+
+        if failed:
+            self.set_status(f"Purged {deleted} old snapshots, {failed} could NOT be deleted{skipped}", STATUS_RESULT)
+        else:
+            self.set_status(f"Purged {deleted} old snapshots{skipped}", STATUS_RESULT)
+
+    def handle_clean_broken(self, stdscr):
+        if not self.confirm_dialog(stdscr, "Delete all .BROKEN subvolumes?"):
+            self.set_status("Clean cancelled")
+            return
+
+        self.show_busy(stdscr, "Cleaning .BROKEN subvolumes...")
+        try:
+            deleted, failed = self.snapshot_manager.clean_broken_subvolumes()
+        except OSError as err:
+            self.set_status(f"Error: cannot read pool directory: {err}", STATUS_LONG)
+            return
+
+        if failed:
+            self.set_status(f"Cleaned {deleted} .BROKEN subvolumes, {failed} could NOT be deleted (still mounted?)",
+                            STATUS_RESULT)
+        elif deleted:
+            self.set_status(f"Cleaned {deleted} .BROKEN subvolumes", STATUS_RESULT)
+        else:
+            self.set_status("No .BROKEN subvolumes found", STATUS_MEDIUM)
+
+    def handle_create_snapshot(self, stdscr):
+        if not self.confirm_dialog(stdscr, "Create new snapshots with btrbk?"):
+            self.set_status("Snapshot creation cancelled")
+            return
+
+        reason = self.create_snapshot(stdscr)
+        # even an interrupted run may have created snapshots already
+        self.invalidate_snapshots()
+        if reason:
+            self.set_status(f"Snapshot creation failed: {reason}", STATUS_RESULT)
+        else:
+            self.set_status("Snapshots created successfully", STATUS_LONG)
+
+    def handle_snapshot_selection(self, stdscr, groups):
         """Handle snapshot selection and restoration with dynamic columns."""
-        if not sorted_prefixes or self.selected_col >= len(sorted_prefixes):
+        if not groups or not groups[self.selected_col][1]:
             return
 
-        current_prefix = sorted_prefixes[self.selected_col]
-        current_snapshots = snapshot_groups.get(current_prefix, [])
+        # The subvolume to replace is the snapshot prefix, untouched:
+        # "@" -> @, "@home" -> @home, "@root" -> @root (never mistaken for "@")
+        subvol_name, snapshots = groups[self.selected_col]
+        snapshot = snapshots[self.selected_row]
 
-        if not current_snapshots or self.selected_row >= len(current_snapshots):
+        if not self.confirm_dialog(stdscr, f"Restore {subvol_name} from {snapshot}?"):
+            self.set_status("Restore cancelled")
             return
 
-        snapshot = current_snapshots[self.selected_row]
-        # Extract snapshot type from prefix
-        if current_prefix == "@":
-            snapshot_type = "root"  # Special case for root subvolume
-        elif current_prefix.startswith('@'):
-            snapshot_type = current_prefix[1:]  # Remove @ prefix for others
-        else:
-            snapshot_type = current_prefix
+        self.show_busy(stdscr, f"Restoring {subvol_name}...")
 
-        # Confirm restoration
-        if not self.confirm_dialog(stdscr, f"Restore {snapshot_type} snapshot?"):
-            self.set_status("Restoration cancelled")
-            return
-
-        # Perform restoration
-        self.set_status("Restoring snapshot...", 30)
-        stdscr.refresh()
-
-        result = self.snapshot_manager.restore_snapshot(snapshot, snapshot_type)
-        if result == "success":
+        outcome, reason = self.snapshot_manager.restore_snapshot(snapshot, subvol_name)
+        if outcome == "success":
             self.reboot_needed = True
-            self.invalidate_snapshots()
-            self.set_status(f"{snapshot_type} snapshot restored! Press H to reboot when ready", 150)
-        elif result == "rollback_failed":
-            self.invalidate_snapshots()
-            self.set_status(f"CRITICAL: {snapshot_type} restore AND rollback failed - manual recovery needed (.BROKEN kept)", 300)
+            self.set_status(f"{subvol_name} restored! Press H to reboot when ready", STATUS_RESULT)
+        elif outcome == "rollback_failed":
+            self.set_status(f"CRITICAL: {subvol_name} restore AND rollback failed, manual recovery needed: {reason}",
+                            STATUS_CRITICAL)
         else:
-            self.set_status(f"Error: {snapshot_type} snapshot restore failed (rolled back)", 150)
+            self.set_status(f"Error: {subvol_name} restore failed, rolled back: {reason}", STATUS_RESULT)
+        self.invalidate_snapshots()
 
     def handle_settings_input(self, stdscr, key):
         """Handle input for settings screen."""
-        settings_count = 5  # Number of settings
+        setting = SETTINGS[self.selected_row][1]
 
-        if key == curses.KEY_UP and self.selected_row > 0:
-            self.selected_row -= 1
-        elif key == curses.KEY_DOWN and self.selected_row < settings_count - 1:
-            self.selected_row += 1
-        elif key in [curses.KEY_ENTER, 10, 13]:
-            settings_keys = ["btr_pool_dir", "snapshots_dir", "auto_cleanup",
-                           "confirm_actions", "show_timestamps"]
-            self.edit_setting(stdscr, settings_keys[self.selected_row])
+        if key == curses.KEY_UP:
+            self.selected_row = max(0, self.selected_row - 1)
+        elif key == curses.KEY_DOWN:
+            self.selected_row = min(len(SETTINGS) - 1, self.selected_row + 1)
+        elif key in ENTER_KEYS:
+            self.edit_setting(stdscr, setting)
         elif key == ord(' '):  # Space to toggle boolean values
-            settings_keys = ["btr_pool_dir", "snapshots_dir", "auto_cleanup",
-                           "confirm_actions", "show_timestamps"]
-            key_name = settings_keys[self.selected_row]
-            if isinstance(self.config.get(key_name), bool):
-                self.config.set(key_name, not self.config.get(key_name))
-                self.config.save()  # Auto-save after toggle
-                self.set_status(f"Toggled {key_name}")
-        elif key in [ord('s'), ord('S')]:
+            self.toggle_setting(setting)
+        elif key_char(key) == "s":
             # Manual save (though auto-save is already active)
-            self.config.save()
-            self.set_status("Settings saved manually!")
-        elif key == 27:  # ESC
+            if self.config.save():
+                self.set_status("Configuration saved", STATUS_MEDIUM)
+            else:
+                self.set_status("Error: failed to save configuration", STATUS_LONG)
+        elif key == KEY_ESC:
             self.current_screen = "main"
             self.selected_row = 0
 
@@ -1044,19 +1185,7 @@ class TUIApp:
         self.init_colors()
 
         while True:
-            stdscr.clear()
-
-            # Draw UI components
-            self.draw_header(stdscr)
-
-            if self.current_screen == "main":
-                self.draw_main_screen(stdscr)
-            elif self.current_screen == "settings":
-                self.draw_settings_screen(stdscr)
-
-            self.draw_status(stdscr)
-            self.draw_footer(stdscr)
-
+            self.draw_screen(stdscr)
             stdscr.refresh()
 
             # Handle input
@@ -1064,19 +1193,60 @@ class TUIApp:
 
             if key == -1:  # Timeout, continue loop
                 continue
-            if key in [ord('q'), ord('Q')]:
+            if key_char(key) == "q":
                 break
             if self.current_screen == "main":
                 self.handle_main_input(stdscr, key)
-            elif self.current_screen == "settings":
+            else:
                 self.handle_settings_input(stdscr, key)
+
+
+def print_purge_plan() -> int:
+    """Print what a purge would delete, without deleting anything."""
+    try:
+        plan = SnapshotManager(Config()).plan_purge()
+    except PurgeError as err:
+        print(f"Error: {err}", file=sys.stderr)
+        return 1
+    if not plan.delete:
+        print("Nothing to purge.")
+    for name in plan.delete:
+        print(f"would delete  {name}")
+    for prefix in plan.skipped:
+        print(f"skipped       {prefix} (no snapshot in common with the backup target)")
+    return 0
+
 
 def main():
     """Main entry point."""
+    args = sys.argv[1:]
+    if args and args[0] in ("--version", "-V"):
+        print(f"btrbk_tui_pro {VERSION}")
+        return
+    if args and args[0] in ("--help", "-h"):
+        print(f"btrbk_tui_pro {VERSION} - restore Btrfs snapshots created with btrbk\n")
+        print("Usage: sudo ./btrbk_tui_pro.py [OPTION]\n")
+        print("  --purge-plan   show what Purge OLD would delete, then exit")
+        print("  -V, --version  show the version")
+        print("  -h, --help     show this help")
+        return
+    if args and args[0] != "--purge-plan":
+        print(f"Error: unknown option '{args[0]}' (try --help)", file=sys.stderr)
+        sys.exit(2)
+
     if os.geteuid() != 0:
         print("Error: This tool requires root privileges.")
         print("Please run with sudo.")
         sys.exit(1)
+
+    if args:
+        sys.exit(print_purge_plan())
+
+    # Without this curses cannot draw non-ASCII snapshot names
+    with contextlib.suppress(locale.Error):
+        locale.setlocale(locale.LC_ALL, "")
+    # Without this ESC is only recognised after a full second
+    os.environ.setdefault("ESCDELAY", "25")
 
     try:
         app = TUIApp()

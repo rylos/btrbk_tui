@@ -16,6 +16,42 @@ This project provides tools to easily restore Btrfs subvolume snapshots created 
 - System reboot with visual indicators
 - Optionally reboot the system after restoration
 
+## ✨ Features v2.8 - TUI Audit (Rust + Python)
+
+A full review of the Rust TUI, the version used day to day, then ported line for
+line to the Python TUI so the two stay identical. Every fix below was exercised
+for real, on both versions: restore, rollback and `.BROKEN` cleanup on a throw-away
+loopback btrfs, snapshot creation and cancelling against a stand-in `btrbk`, the
+purge plan against the live backup target.
+
+### 🛡️ **Safety:**
+- **`@root` is no longer restored over `@`**: the subvolume to replace was derived from a *type name*, and the type of `@` was spelled `root` — so a snapshot of a subvolume really called `@root` would have replaced the root filesystem. The snapshot prefix is now used as-is. The CLI was already correct
+- **Cancelling a btrbk run no longer leaves orphans**: ESC used to `SIGKILL` btrbk alone, leaving `btrfs send`, `ssh` and `pv` running as root with nobody to clean up. btrbk now runs in its own session; ESC sends `SIGINT` to the whole group — what Ctrl-C does in a shell, the case btrbk handles — then `SIGKILL` after 5 seconds to whatever is left
+- **`rename(2)` instead of `mv`** for the `.BROKEN` move and its rollback: across filesystems it fails, where `mv` would start copying a subvolume
+- **The config never falls back to `/tmp`**: a root tool must not read paths for `btrfs subvolume delete` from a world-writable directory
+- **A panic restores the terminal** before printing, instead of leaving it in curses mode
+
+### 🐛 **Bugs:**
+- **Busy messages were never drawn**: "Checking backup target...", "Restoring snapshot..." were stored and then `refresh()`ed without being painted, so the interface just froze. They are now drawn before the blocking call
+- **With no snapshots, every key was ignored** — including `S`, the one needed to fix a wrong path, and `I`
+- **The selection could leave the screen**: with more snapshots than rows the cursor moved on invisibly. The selected column now scrolls and shows `[5-7 of 12]`; the selection is clamped after refresh, purge and restore. `Home`/`End` added
+- **Progress meters were not live**: output was split on `\n` only, so `\r`-rewritten progress arrived as one giant line at the end. Streams are now split on both, and a progress line replaces the previous one
+- **The "press any key" result screen was usually skipped** because of a race between the pipes closing and the exit status being noticed
+- **ESC took a full second** to register (`ESCDELAY`)
+- **Purge reports failures** ("3 could NOT be deleted") instead of counting only successes, and names the subvolumes it skipped because they share nothing with the target
+- **`ssh_identity`, `ssh_user` and `ssh_port`** from `btrbk.conf` are honoured when querying the target; IPv6 targets and `target send-receive ssh://...` are parsed
+- **Timestamps**: btrbk's `short` and `long-iso` formats and the `_N` suffix are understood; a subvolume name containing a dot no longer splits in the wrong place
+- A config file missing a field no longer discards the whole file; a failed config save is reported; the header showed `v2.6`
+
+### ✨ **Improvements:**
+- **Purge shows its hand first**: the target is checked, then the dialog asks "Delete 18 old snapshots?" — no more confirming blind. `sudo btrbk_tui --purge-plan` prints the same plan without deleting anything
+- **Errors say why**: the last line of stderr reaches the status bar ("restore failed, rolled back: restored root has no /etc/fstab")
+- **No more flicker**: `erase()` instead of `clear()`, which forced a full terminal repaint ten times a second
+- **Any terminal size**: all drawing goes through one clipping helper, so a tiny window can no longer panic or wrap
+- Status messages last a fixed time instead of a number of frames; the restore dialog names the snapshot; the footer follows the screen
+- **13 unit tests per version** (Rust had 3, Python none): purge planning, snapshot grouping, timestamps, ssh target parsing, output cleaning, progress handling. `cargo test` and `python3 -m unittest discover -s tests -p '*_test.py'` check the same cases, so the two versions cannot drift apart on what a purge may delete
+- **Python only**: reading btrbk's output blocked the interface (ESC was ignored until the next line arrived), and after a snapshot run the main loop lost its timeout, freezing status messages until a key was pressed. Output is now read without blocking, like the Rust version does with threads
+
 ## ✨ Features v2.7 - Chain-Aware Purge
 
 ### 🔗 **Purge no longer breaks incremental backups (Python + Rust):**
@@ -200,7 +236,7 @@ The tool automatically handles snapshots with this nomenclature:
 ### Dynamic Column Versions (TUI Pro Python/Rust):
 
 #### Main Screen:
-- **↑↓**: Vertical navigation through snapshots
+- **↑↓**: Vertical navigation through snapshots, **Home/End** for first and last
 - **←→**: Dynamic column switching (adaptive to number of groups)
 - **ENTER**: Snapshot selection and restoration
 - **S**: Access settings screen
@@ -233,8 +269,9 @@ The tool automatically handles snapshots with this nomenclature:
 - **Chain-aware**: queries the backup target and keeps the newest snapshot the target also holds, plus everything newer. That snapshot is the parent for the next incremental send — deleting it forces a full send on the next run
 - **Deletes** only the snapshots older than that parent
 - **Refuses to purge** when the target is unreachable, or when no snapshot is shared with it: without that information there is no safe way to tell what can go
-- **Confirmation** before operation for safety
-- **Detailed feedback** on how many snapshots were deleted
+- **Confirmation** after the check, stating how many snapshots will go
+- **Dry run**: `sudo btrbk_tui --purge-plan` (or `sudo ./btrbk_tui_pro.py --purge-plan`) lists what would be deleted
+- **Detailed feedback** on how many snapshots were deleted, failed or skipped
 - **Error handling**: Continues operation even if individual deletions fail
 - **Space optimization**: Frees disk space without ever breaking the incremental chain
 
@@ -391,8 +428,9 @@ btrbk_tui/
 - **Rust**: `ncurses`, `serde`, `serde_json`, `chrono`, `dirs`, `libc`
 
 ### **Linting:**
-- **Python**: [`ruff`](https://docs.astral.sh/ruff/) — `ruff check btrbk_tui.py btrbk_tui_pro.py`
+- **Python**: [`ruff`](https://docs.astral.sh/ruff/) — `ruff check .`
 - **Rust**: `cargo clippy` — both pass with zero warnings
+- **Tests**: `cargo test` (in `btrbk_tui_rust/`) and `python3 -m unittest discover -s tests -p '*_test.py'` — the same 13 cases on both sides
 
 ### **Testing:**
 - Tested on Arch Linux with KDE Plasma 6
