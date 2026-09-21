@@ -33,3 +33,6 @@ Set completo di strumenti per il ripristino di snapshot Btrfs creati con btrbk. 
 - Uso quotidiano: `sudo btrbk_tui` = TUI Rust (symlink /usr/local/bin)
 
 ### Stato: Tutte le versioni ✅ Produzione v2.8 (2026-09-21)
+
+### Documentazione esterna
+Nota wiki Joplin dedicata (notebook Backup & Storage): «BTRBK TUI — restore, purge e snapshot btrbk da terminale», id `5e37ad8b6c5542138e3d94ce6903de3c`. Va aggiornata quando cambiano tasti, opzioni da shell o il flusso di restore/purge (poi `wiki log` e `wiki brief --write`).
