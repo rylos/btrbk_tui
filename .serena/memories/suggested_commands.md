@@ -53,3 +53,12 @@ sudo ./btrbk_tui_pro.py --purge-plan
 ls -la /mnt/btr_pool/btrbk_snapshots/
 cat ~/.config/btrbk_tui/config.json
 ```
+
+## Release GitHub
+```bash
+V=2.9.0; B=btrbk_tui-$V-x86_64-linux
+cp btrbk_tui_rust/target/release/btrbk_tui $B && strip $B && sha256sum $B > $B.sha256
+# note: sezione "Features vX.Y" del README
+gh release create v$V --target main --title "v$V - ..." --notes-file notes.md $B $B.sha256
+```
+Versione da allineare prima: Cargo.toml, VERSION in btrbk_tui_pro.py, README.

@@ -10,6 +10,7 @@
 - **CLI**: importa da `btrbk_tui_pro` (Config, group_snapshots, split_snapshot_name, parse_btrbk_timestamp, mounted_subvolume, VERSION) invece di duplicare la logica: va eseguita dalla directory del repo accanto a `btrbk_tui_pro.py`.
 - 15 test per versione. README: sezione "Layout requirements" (btr_pool_dir = top level subvolid=5; snapshot fuori dai subvolumi, `/home/.snapshots` non è ripristinabile per swap).
 - Issue GitHub: risposte a tutte (#1-#5); #2 (esecuzione come utente non root) e #3 (più volumi letti da btrbk.conf) restano aperte come richieste di funzionalità.
+- **Prima release GitHub**: v2.9.0 (tag su 6f3c6c2) con binario Rust x86_64 ridotto con strip + `.sha256`. #5 chiusa, #1/#4 etichettate `bug` e aperte in attesa di conferma, #2/#3 `enhancement`.
 
 
 ## v2.8 - Audit della TUI Rust (2026-09-21)
