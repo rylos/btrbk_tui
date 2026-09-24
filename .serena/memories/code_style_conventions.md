@@ -1,4 +1,4 @@
-# Code Style - BTRBK TUI v2.8
+# Code Style - BTRBK TUI v2.9
 
 ## Python (comune)
 - Lint: `ruff` con regole fissate in `.ruff.toml` (E, W, F, I, UP, B, C4, SIM, RET, PL, RUF, S, DTZ, EXE; target py39). Deroghe documentate inline (PLW1510, BLE001, S110, DTZ005/DTZ007, PLW0603)

@@ -3,7 +3,9 @@ use ncurses::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
+use std::ffi::{CStr, OsStr};
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -112,7 +114,12 @@ enum Screen {
 
 struct App {
     config: Config,
+    /// Where the configuration is saved.
     config_path: PathBuf,
+    /// Where it was read from, when that is somewhere else (an old location).
+    config_read_from: Option<PathBuf>,
+    /// uid/gid to give a config written as root into the invoking user's home.
+    config_owner: Option<(u32, u32)>,
     screen: Screen,
     selected_row: usize,
     selected_col: usize,
@@ -125,17 +132,34 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
-        // Mai ripiegare su una directory scrivibile da tutti: questo tool gira
-        // come root e la config decide su quali path agiscono mv e btrfs delete.
-        let config_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/root"))
-            .join(".config")
-            .join("btrbk_tui")
-            .join("config.json");
+    /// `config_file` is the --config option; without it the file is looked up
+    /// with `config_candidates`.
+    fn new(config_file: Option<PathBuf>) -> Self {
+        let invoking = invoking_user();
+        let (config_path, read_from) = match config_file {
+            Some(path) => (path, None),
+            None => {
+                let candidates = config_candidates(
+                    invoking.as_ref().map(|user| user.home.as_path()),
+                    dirs::home_dir().as_deref(),
+                );
+                let found = candidates.iter().find(|path| path.is_file()).cloned();
+                // An old location is read but never written: saving moves the
+                // settings to the current name
+                match found {
+                    Some(path) if !is_legacy_config(&path) => (path, None),
+                    other => (candidates[0].clone(), other),
+                }
+            }
+        };
+        let config_owner = invoking
+            .filter(|user| config_path.starts_with(&user.home))
+            .map(|user| (user.uid, user.gid));
 
         let mut app = App {
             config: Config::default(),
+            config_read_from: read_from,
+            config_owner,
             config_path,
             screen: Screen::Main,
             selected_row: 0,
@@ -166,22 +190,44 @@ impl App {
     }
 
     fn load_config(&mut self) {
-        if let Ok(content) = fs::read_to_string(&self.config_path)
+        let source = self.config_read_from.as_ref().unwrap_or(&self.config_path);
+        if let Ok(content) = fs::read_to_string(source)
             && let Ok(saved_config) = serde_json::from_str::<Config>(&content)
         {
             self.config = saved_config;
         }
     }
 
-    fn save_config(&self) -> bool {
-        if let Some(parent) = self.config_path.parent() {
-            let _ = fs::create_dir_all(parent);
+    fn save_config(&mut self) -> bool {
+        let Ok(json) = serde_json::to_string_pretty(&self.config) else {
+            return false;
+        };
+
+        // Directories about to be created, so that they can be handed over too
+        let mut created = Vec::new();
+        let mut dir = self.config_path.parent();
+        while let Some(path) = dir.filter(|path| !path.exists()) {
+            created.push(path.to_path_buf());
+            dir = path.parent();
+        }
+        if let Some(parent) = self.config_path.parent()
+            && fs::create_dir_all(parent).is_err()
+        {
+            return false;
+        }
+        if fs::write(&self.config_path, json).is_err() {
+            return false;
         }
 
-        match serde_json::to_string_pretty(&self.config) {
-            Ok(json) => fs::write(&self.config_path, json).is_ok(),
-            Err(_) => false,
+        // Written as root into the invoking user's home: give it back to them,
+        // or their next edit of their own file would need root
+        if let Some((uid, gid)) = self.config_owner {
+            for path in created.iter().chain(std::iter::once(&self.config_path)) {
+                let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
+            }
         }
+        self.config_read_from = None;
+        true
     }
 
     fn get_snapshots(&self) -> SnapshotGroups {
@@ -646,6 +692,13 @@ impl App {
             4,
             &format!("Config: {} ({})", self.config_path.display(), config_exists),
         );
+        if let Some(old) = &self.config_read_from {
+            put(
+                height - 4,
+                4,
+                &format!("Read from the old location {}: saving moves it", old.display()),
+            );
+        }
         attroff(A_DIM());
     }
 
@@ -670,10 +723,13 @@ impl App {
         let (height, width) = get_max_yx();
         let width = width.max(0) as usize;
         let hint = "Y: Yes | N: No";
-        let wanted = message.chars().count().max(hint.len()) + 6;
+        let lines: Vec<&str> = message.lines().collect();
+        let longest = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
+        let wanted = longest.max(hint.len()) + 6;
         let dialog_width = wanted.min(width.saturating_sub(4)).max(8);
-        let dialog_height = 5;
-        let dialog_y = height / 2 - 2;
+        // border, message, blank, hint, border
+        let dialog_height = lines.len() as i32 + 4;
+        let dialog_y = height / 2 - dialog_height / 2;
         let dialog_x = (width.saturating_sub(dialog_width) / 2) as i32;
         let inner = dialog_width - 2;
 
@@ -687,8 +743,10 @@ impl App {
         put(dialog_y + dialog_height - 1, dialog_x, &border);
         attroff(A_BOLD());
 
-        put(dialog_y + 1, dialog_x + 3, &truncate_str(message, inner.saturating_sub(4)));
-        put(dialog_y + 3, dialog_x + 3, &truncate_str(hint, inner.saturating_sub(4)));
+        for (i, line) in lines.iter().enumerate() {
+            put(dialog_y + 1 + i as i32, dialog_x + 3, &truncate_str(line, inner.saturating_sub(4)));
+        }
+        put(dialog_y + dialog_height - 2, dialog_x + 3, &truncate_str(hint, inner.saturating_sub(4)));
         refresh();
 
         timeout(-1);
@@ -808,9 +866,20 @@ impl App {
         run_command(&["btrfs", "subvolume", "show", &restored_subvol.to_string_lossy()])
             .map_err(|reason| format!("restored path is not a subvolume: {}", reason))?;
 
-        // 3. Verifica file/directory critici in base al subvolume
-        match subvol_name {
-            "@" => {
+        // 3. Verifica file/directory critici in base al subvolume. Root e home
+        // si riconoscono dal nome "@"/"@home" o da ciò che è montato su / e
+        // /home: nei layout senza "@" si chiamano root, rootfs, home...
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mounted_at = |mountpoint: &str| mounted_subvolume(&mountinfo, mountpoint);
+        let kind = if subvol_name == "@" || mounted_at("/").as_deref() == Some(subvol_name) {
+            "root"
+        } else if subvol_name == "@home" || mounted_at("/home").as_deref() == Some(subvol_name) {
+            "home"
+        } else {
+            "other"
+        };
+        match kind {
+            "root" => {
                 for dir in ["etc", "usr", "var", "bin"] {
                     if !restored_subvol.join(dir).exists() {
                         return Err(format!("restored root has no /{}", dir));
@@ -822,7 +891,7 @@ impl App {
                     }
                 }
             }
-            "@home" => {
+            "home" => {
                 let mut entries = fs::read_dir(restored_subvol)
                     .map_err(|err| format!("restored home is unreadable: {}", err))?;
                 if entries.next().is_none() {
@@ -994,8 +1063,16 @@ impl App {
         };
 
         // Il subvolume da sostituire è il prefisso dello snapshot, così com'è:
-        // "@" -> @, "@home" -> @home, "@root" -> @root (mai confuso con "@")
-        if !self.confirm_dialog(&format!("Restore {} from {}?", subvol_name, snapshot)) {
+        // "@" -> @, "@home" -> @home, "@root" -> @root (mai confuso con "@").
+        // Il dialogo dice quale path verrà toccato: con un pool sbagliato nei
+        // settings sarebbe creato un subvolume nuovo invece di sostituirlo
+        let target = Path::new(&self.config.btr_pool_dir).join(subvol_name);
+        let effect = if target.exists() {
+            format!("Replaces {} (the old one is kept as .BROKEN)", target.display())
+        } else {
+            format!("WARNING: {} does not exist, it will be CREATED", target.display())
+        };
+        if !self.confirm_dialog(&format!("Restore {} from {}?\n{}", subvol_name, snapshot, effect)) {
             self.set_status("Restore cancelled", STATUS_SHORT);
             return;
         }
@@ -1265,11 +1342,14 @@ fn clean_output_line(line: &str) -> String {
     cleaned
 }
 
-/// Splits "@home.20260803T0000" into subvolume name and timestamp. The
-/// timestamp never contains a dot, the subvolume name might.
+/// Splits "@home.20260803T0000" or "home.20260803T0000" into subvolume name
+/// and timestamp. The timestamp never contains a dot, the subvolume name
+/// might. A name counts as a snapshot only when what follows the last dot is
+/// a btrbk timestamp: btrbk names snapshots after the subvolume, which may or
+/// may not start with "@".
 fn split_snapshot_name(name: &str) -> Option<(&str, &str)> {
     let (prefix, timestamp) = name.rsplit_once('.')?;
-    (prefix.starts_with('@') && !timestamp.is_empty()).then_some((prefix, timestamp))
+    (!prefix.is_empty() && parse_btrbk_timestamp(timestamp).is_some()).then_some((prefix, timestamp))
 }
 
 /// Groups snapshot names by subvolume: "@" first, then alphabetically, newest
@@ -1343,6 +1423,76 @@ fn compute_purge_plan(
         }
     }
     plan
+}
+
+/// Where the configuration may live, most wanted first. Under sudo or pkexec
+/// it belongs to the user who invoked the tool, not to root: that is where
+/// they create it, since sudo resets HOME to /root. `btrbk_restore` is the
+/// name the directory had until 2025-09: it is still read, never written.
+fn config_candidates(invoking_home: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut homes: Vec<&Path> = invoking_home.into_iter().collect();
+    if let Some(home) = home
+        && !homes.contains(&home)
+    {
+        homes.push(home);
+    }
+    // Mai ripiegare su una directory scrivibile da tutti: questo tool gira
+    // come root e la config decide su quali path agiscono rename e btrfs delete
+    if homes.is_empty() {
+        homes.push(Path::new("/root"));
+    }
+    ["btrbk_tui", "btrbk_restore"]
+        .iter()
+        .flat_map(|dir| homes.iter().map(move |home| home.join(".config").join(dir).join("config.json")))
+        .collect()
+}
+
+fn is_legacy_config(path: &Path) -> bool {
+    path.parent().and_then(Path::file_name) == Some(OsStr::new("btrbk_restore"))
+}
+
+/// The user behind sudo or pkexec.
+struct InvokingUser {
+    uid: u32,
+    gid: u32,
+    home: PathBuf,
+}
+
+fn invoking_user() -> Option<InvokingUser> {
+    let uid: u32 = std::env::var("SUDO_UID")
+        .or_else(|_| std::env::var("PKEXEC_UID"))
+        .ok()?
+        .parse()
+        .ok()?;
+    if uid == 0 {
+        return None;
+    }
+    // SAFETY: called before any thread is started; the record is copied out
+    // before anything else can call into the passwd database
+    unsafe {
+        let entry = libc::getpwuid(uid);
+        if entry.is_null() || (*entry).pw_dir.is_null() {
+            return None;
+        }
+        let home = OsStr::from_bytes(CStr::from_ptr((*entry).pw_dir).to_bytes());
+        Some(InvokingUser { uid, gid: (*entry).pw_gid, home: PathBuf::from(home) })
+    }
+}
+
+/// Subvolume mounted at `mountpoint`, relative to the top level of its
+/// filesystem, from the content of /proc/self/mountinfo.
+fn mounted_subvolume(mountinfo: &str, mountpoint: &str) -> Option<String> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (mount, fs) = line.split_once(" - ")?;
+            let fields: Vec<&str> = mount.split_whitespace().collect();
+            let fstype = fs.split_whitespace().next()?;
+            (fstype == "btrfs" && fields.get(4) == Some(&mountpoint)).then(|| fields.get(3).copied())?
+        })
+        // the last mount on a path is the one in effect
+        .next_back()
+        .map(|root| root.trim_start_matches('/').to_string())
 }
 
 /// First ssh:// target declared in a btrbk configuration, with the ssh options
@@ -1559,8 +1709,8 @@ fn get_max_yx() -> (i32, i32) {
 }
 
 /// Prints what a purge would delete, without deleting anything.
-fn print_purge_plan() -> i32 {
-    let app = App::new();
+fn print_purge_plan(config_file: Option<PathBuf>) -> i32 {
+    let app = App::new(config_file);
     match app.plan_purge() {
         Ok(plan) => {
             if plan.delete.is_empty() {
@@ -1582,24 +1732,37 @@ fn print_purge_plan() -> i32 {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        None | Some("--purge-plan") => {}
-        Some("--version" | "-V") => {
-            println!("btrbk_tui {}", VERSION);
-            return;
-        }
-        Some("--help" | "-h") => {
-            println!("btrbk_tui {} - restore Btrfs snapshots created with btrbk\n", VERSION);
-            println!("Usage: sudo btrbk_tui [OPTION]\n");
-            println!("  --purge-plan   show what Purge OLD would delete, then exit");
-            println!("  -V, --version  show the version");
-            println!("  -h, --help     show this help");
-            return;
-        }
-        Some(other) => {
-            eprintln!("Error: unknown option '{}' (try --help)", other);
-            std::process::exit(2);
+    let mut purge_plan = false;
+    let mut config_file = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--purge-plan" => purge_plan = true,
+            "--config" | "-c" => match args.next() {
+                Some(path) => config_file = Some(PathBuf::from(path)),
+                None => {
+                    eprintln!("Error: {} needs a file (try --help)", arg);
+                    std::process::exit(2);
+                }
+            },
+            "--version" | "-V" => {
+                println!("btrbk_tui {}", VERSION);
+                return;
+            }
+            "--help" | "-h" => {
+                println!("btrbk_tui {} - restore Btrfs snapshots created with btrbk\n", VERSION);
+                println!("Usage: sudo btrbk_tui [OPTION]...\n");
+                println!("  -c, --config FILE  use FILE as configuration (default: ~/.config/btrbk_tui/config.json");
+                println!("                     of the user who ran sudo)");
+                println!("  --purge-plan       show what Purge OLD would delete, then exit");
+                println!("  -V, --version      show the version");
+                println!("  -h, --help         show this help");
+                return;
+            }
+            other => {
+                eprintln!("Error: unknown option '{}' (try --help)", other);
+                std::process::exit(2);
+            }
         }
     }
 
@@ -1610,8 +1773,8 @@ fn main() {
         std::process::exit(1);
     }
 
-    if !args.is_empty() {
-        std::process::exit(print_purge_plan());
+    if purge_plan {
+        std::process::exit(print_purge_plan(config_file));
     }
 
     // Un panic dentro curses lascerebbe il terminale inutilizzabile e il
@@ -1632,7 +1795,7 @@ fn main() {
     set_escdelay(25);
 
     // Create and run the TUI app
-    let mut app = App::new();
+    let mut app = App::new(config_file);
     app.run();
 
     // Cleanup
@@ -1717,9 +1880,50 @@ ID 257 gen 1 top level 5 parent_uuid - received_uuid - uuid 0ed5ab3d-732e-4544-8
         assert_eq!(split_snapshot_name("@home.20260803T0000"), Some(("@home", "20260803T0000")));
         assert_eq!(split_snapshot_name("@.20260803T0000_1"), Some(("@", "20260803T0000_1")));
         assert_eq!(split_snapshot_name("@my.data.20260803"), Some(("@my.data", "20260803")));
-        assert_eq!(split_snapshot_name("@home"), None);
+        // btrbk's default naming: the subvolume name, with or without "@"
+        assert_eq!(split_snapshot_name("home.20250901T0800"), Some(("home", "20250901T0800")));
+        assert_eq!(split_snapshot_name("home"), None);
         assert_eq!(split_snapshot_name("@home."), None);
+        assert_eq!(split_snapshot_name(".20250901T0800"), None);
+        // a dot alone does not make a snapshot: what follows must be a timestamp
         assert_eq!(split_snapshot_name("scripts.d"), None);
+        assert_eq!(split_snapshot_name("prune_snapshots_keep_parent.sh"), None);
+        assert_eq!(split_snapshot_name("@home.BROKEN"), None);
+    }
+
+    #[test]
+    fn config_belongs_to_the_user_behind_sudo() {
+        let candidates = config_candidates(Some(Path::new("/home/user")), Some(Path::new("/root")));
+        let expected = [
+            "/home/user/.config/btrbk_tui/config.json",
+            "/root/.config/btrbk_tui/config.json",
+            "/home/user/.config/btrbk_restore/config.json",
+            "/root/.config/btrbk_restore/config.json",
+        ];
+        assert_eq!(candidates, expected.iter().map(PathBuf::from).collect::<Vec<_>>());
+        assert!(is_legacy_config(&candidates[2]));
+        assert!(!is_legacy_config(&candidates[0]));
+
+        // plain root login: no duplicates, and never a world-writable fallback
+        assert_eq!(config_candidates(None, Some(Path::new("/root"))).len(), 2);
+        assert_eq!(config_candidates(None, None)[0], PathBuf::from("/root/.config/btrbk_tui/config.json"));
+    }
+
+    #[test]
+    fn mounted_subvolumes_come_from_mountinfo() {
+        let mountinfo = "\
+23 1 0:21 /@ / rw,relatime shared:1 - btrfs /dev/nvme0n1p2 rw,subvol=/@
+24 23 0:21 /@home /home rw,relatime shared:2 - btrfs /dev/nvme0n1p2 rw,subvol=/@home
+25 23 0:21 / /mnt/btr_pool rw,relatime shared:3 - btrfs /dev/nvme0n1p2 rw,subvolid=5
+26 23 0:22 / /tmp rw shared:4 - tmpfs tmpfs rw
+27 24 0:21 /home /home rw,relatime shared:5 - btrfs /dev/sda1 rw,subvol=/home
+";
+        assert_eq!(mounted_subvolume(mountinfo, "/").as_deref(), Some("@"));
+        // mounted twice: the later mount hides the earlier one
+        assert_eq!(mounted_subvolume(mountinfo, "/home").as_deref(), Some("home"));
+        assert_eq!(mounted_subvolume(mountinfo, "/mnt/btr_pool").as_deref(), Some(""));
+        assert_eq!(mounted_subvolume(mountinfo, "/tmp"), None);
+        assert_eq!(mounted_subvolume(mountinfo, "/var"), None);
     }
 
     #[test]

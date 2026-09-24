@@ -9,6 +9,7 @@ import curses
 import json
 import locale
 import os
+import pwd
 import re
 import select
 import signal
@@ -19,10 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.8.0"
-
-# Configuration file path
-CONFIG_FILE = Path.home() / ".config" / "btrbk_tui" / "config.json"
+VERSION = "2.9.0"
 
 # btrbk configuration, read to discover the backup target
 BTRBK_CONF = "/etc/btrbk/btrbk.conf"
@@ -72,12 +70,15 @@ def clean_output_line(line: str) -> str:
 
 
 def split_snapshot_name(name: str) -> tuple[str, str] | None:
-    """Split "@home.20260803T0000" into subvolume name and timestamp.
+    """Split "@home.20260803T0000" or "home.20260803T0000" into subvolume name and timestamp.
 
-    The timestamp never contains a dot, the subvolume name might.
+    The timestamp never contains a dot, the subvolume name might. A name
+    counts as a snapshot only when what follows the last dot is a btrbk
+    timestamp: btrbk names snapshots after the subvolume, which may or may
+    not start with "@".
     """
     prefix, dot, timestamp = name.rpartition(".")
-    if not dot or not prefix.startswith("@") or not timestamp:
+    if not dot or not prefix or parse_btrbk_timestamp(timestamp) is None:
         return None
     return prefix, timestamp
 
@@ -119,6 +120,63 @@ def parse_btrbk_timestamp(timestamp: str) -> datetime | None:
         return datetime.strptime(base, fmt)
     except ValueError:
         return None
+
+
+def config_candidates(invoking_home: Path | None, home: Path | None) -> list[Path]:
+    """Where the configuration may live, most wanted first.
+
+    Under sudo or pkexec it belongs to the user who invoked the tool, not to
+    root: that is where they create it, since sudo resets HOME to /root.
+    "btrbk_restore" is the name the directory had until 2025-09: it is still
+    read, never written.
+    """
+    homes = [invoking_home] if invoking_home else []
+    if home and home not in homes:
+        homes.append(home)
+    # Never fall back on a world-writable directory: this tool runs as root
+    # and the config decides which paths rename and btrfs delete act on
+    if not homes:
+        homes.append(Path("/root"))
+    return [h / ".config" / d / "config.json" for d in ("btrbk_tui", "btrbk_restore") for h in homes]
+
+
+def is_legacy_config(path: Path) -> bool:
+    return path.parent.name == "btrbk_restore"
+
+
+@dataclass
+class InvokingUser:
+    """The user behind sudo or pkexec."""
+
+    uid: int
+    gid: int
+    home: Path
+
+
+def invoking_user() -> InvokingUser | None:
+    try:
+        uid = int(os.environ.get("SUDO_UID") or os.environ["PKEXEC_UID"])
+        entry = pwd.getpwuid(uid)
+    except (KeyError, ValueError):
+        return None
+    if uid == 0:
+        return None
+    return InvokingUser(uid=uid, gid=entry.pw_gid, home=Path(entry.pw_dir))
+
+
+def mounted_subvolume(mountinfo: str, mountpoint: str) -> str | None:
+    """Subvolume mounted at `mountpoint`, relative to the top level of its filesystem.
+
+    Reads the content of /proc/self/mountinfo.
+    """
+    found = None
+    for line in mountinfo.splitlines():
+        mount, sep, fs = line.partition(" - ")
+        fields = mount.split()
+        # the last mount on a path is the one in effect
+        if sep and fs.split()[:1] == ["btrfs"] and len(fields) > 4 and fields[4] == mountpoint:
+            found = fields[3].lstrip("/")
+    return found
 
 
 @dataclass
@@ -311,35 +369,61 @@ def run_command(cmd: list[str]) -> str | None:
 # --- configuration ------------------------------------------------------------
 
 class Config:
-    """Configuration manager for the application."""
+    """Configuration manager for the application.
 
-    def __init__(self):
+    `path` is the --config option; without it the file is looked up with
+    config_candidates().
+    """
+
+    def __init__(self, path: Path | None = None):
         self.data = DEFAULT_CONFIG.copy()
+        invoking = invoking_user()
+        self.read_from: Path | None = None  # set when read from an old location
+        if path is None:
+            candidates = config_candidates(invoking.home if invoking else None, Path.home())
+            found = next((c for c in candidates if c.is_file()), None)
+            # An old location is read but never written: saving moves the
+            # settings to the current name
+            if found and not is_legacy_config(found):
+                path = found
+            else:
+                path, self.read_from = candidates[0], found
+        self.path = path
+        # uid/gid to give a config written as root into the invoking user's home
+        self.owner = (invoking.uid, invoking.gid) if invoking and path.is_relative_to(invoking.home) else None
         self.load()
 
     def load(self):
         """Load configuration from file."""
         try:
-            if CONFIG_FILE.exists():
-                with open(CONFIG_FILE) as f:
-                    saved_config = json.load(f)
-                    # Merge saved config with defaults (in case new keys were added)
-                    for key, value in saved_config.items():
-                        if key in DEFAULT_CONFIG:  # Only load known keys
-                            self.data[key] = value
+            with open(self.read_from or self.path) as f:
+                saved_config = json.load(f)
+            # Merge saved config with defaults (in case new keys were added)
+            for key, value in saved_config.items():
+                if key in DEFAULT_CONFIG:  # Only load known keys
+                    self.data[key] = value
         except Exception:
-            # If loading fails, use defaults
+            # Missing or unreadable: use defaults
             pass
 
     def save(self):
         """Save configuration to file."""
+        # Directories about to be created, so that they can be handed over too
+        created = [d for d in self.path.parents if not d.exists()]
         try:
-            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(CONFIG_FILE, 'w') as f:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, 'w') as f:
                 json.dump(self.data, f, indent=2)
-            return True
         except Exception:
             return False
+        # Written as root into the invoking user's home: give it back to them,
+        # or their next edit of their own file would need root
+        if self.owner:
+            for p in [*created, self.path]:
+                with contextlib.suppress(OSError):
+                    os.chown(p, *self.owner)
+        self.read_from = None
+        return True
 
     def get(self, key: str, default=None):
         """Get configuration value."""
@@ -469,15 +553,28 @@ class SnapshotManager:
         if reason:
             return f"restored path is not a subvolume: {reason}"
 
+        # Root and home are recognised by the names "@"/"@home" or by what is
+        # mounted on / and /home: layouts without "@" call them root, rootfs, home...
         try:
-            if subvol_name == "@":
+            mountinfo = Path("/proc/self/mountinfo").read_text()
+        except OSError:
+            mountinfo = ""
+        if subvol_name == "@" or mounted_subvolume(mountinfo, "/") == subvol_name:
+            kind = "root"
+        elif subvol_name == "@home" or mounted_subvolume(mountinfo, "/home") == subvol_name:
+            kind = "home"
+        else:
+            kind = "other"
+
+        try:
+            if kind == "root":
                 for d in ["etc", "usr", "var", "bin"]:
                     if not os.path.exists(os.path.join(restored_subvol, d)):
                         return f"restored root has no /{d}"
                 for f in ["etc/fstab", "etc/passwd"]:
                     if not os.path.isfile(os.path.join(restored_subvol, f)):
                         return f"restored root has no /{f}"
-            elif subvol_name == "@home":
+            elif kind == "home":
                 if not os.listdir(restored_subvol):
                     return "restored home is empty"
             else:
@@ -614,8 +711,8 @@ def key_char(key: int) -> str | None:
 class TUIApp:
     """Main TUI application."""
 
-    def __init__(self):
-        self.config = Config()
+    def __init__(self, config_file: Path | None = None):
+        self.config = Config(config_file)
         self.snapshot_manager = SnapshotManager(self.config)
         self.current_screen = "main"
         self.selected_row = 0
@@ -776,8 +873,11 @@ class TUIApp:
             put(stdscr, y + 1, 6, value_str, attr)
 
         # Show config file path and status
-        config_exists = "EXISTS" if CONFIG_FILE.exists() else "NOT FOUND"
-        put(stdscr, height - 5, 4, f"Config: {CONFIG_FILE} ({config_exists})", curses.A_DIM)
+        config_exists = "EXISTS" if self.config.path.exists() else "NOT FOUND"
+        put(stdscr, height - 5, 4, f"Config: {self.config.path} ({config_exists})", curses.A_DIM)
+        if self.config.read_from:
+            put(stdscr, height - 4, 4, f"Read from the old location {self.config.read_from}: saving moves it",
+                curses.A_DIM)
 
     def draw_screen(self, stdscr):
         """Draw the whole interface."""
@@ -907,9 +1007,10 @@ class TUIApp:
 
         height, width = stdscr.getmaxyx()
         hint = "Y: Yes | N: No"
-        dialog_width = max(8, min(max(len(message), len(hint)) + 6, width - 4))
-        dialog_height = 5
-        dialog_y = height // 2 - 2
+        lines = message.splitlines()
+        dialog_width = max(8, min(max([*map(len, lines), len(hint)]) + 6, width - 4))
+        dialog_height = len(lines) + 4  # border, message, blank, hint, border
+        dialog_y = height // 2 - dialog_height // 2
         dialog_x = max(0, (width - dialog_width) // 2)
         inner = dialog_width - 2
 
@@ -918,8 +1019,9 @@ class TUIApp:
         for i in range(1, dialog_height - 1):
             put(stdscr, dialog_y + i, dialog_x, f"|{' ' * inner}|", curses.A_BOLD)
         put(stdscr, dialog_y + dialog_height - 1, dialog_x, border, curses.A_BOLD)
-        put(stdscr, dialog_y + 1, dialog_x + 3, message[:max(0, inner - 4)])
-        put(stdscr, dialog_y + 3, dialog_x + 3, hint[:max(0, inner - 4)])
+        for i, line in enumerate(lines):
+            put(stdscr, dialog_y + 1 + i, dialog_x + 3, line[:max(0, inner - 4)])
+        put(stdscr, dialog_y + dialog_height - 2, dialog_x + 3, hint[:max(0, inner - 4)])
         stdscr.refresh()
 
         stdscr.timeout(-1)
@@ -1138,7 +1240,14 @@ class TUIApp:
         subvol_name, snapshots = groups[self.selected_col]
         snapshot = snapshots[self.selected_row]
 
-        if not self.confirm_dialog(stdscr, f"Restore {subvol_name} from {snapshot}?"):
+        # The dialog names the path that will be touched: with a wrong pool in
+        # the settings a new subvolume would be created instead of replaced
+        target = os.path.join(self.config.get("btr_pool_dir"), subvol_name)
+        if os.path.exists(target):
+            effect = f"Replaces {target} (the old one is kept as .BROKEN)"
+        else:
+            effect = f"WARNING: {target} does not exist, it will be CREATED"
+        if not self.confirm_dialog(stdscr, f"Restore {subvol_name} from {snapshot}?\n{effect}"):
             self.set_status("Restore cancelled")
             return
 
@@ -1201,10 +1310,10 @@ class TUIApp:
                 self.handle_settings_input(stdscr, key)
 
 
-def print_purge_plan() -> int:
+def print_purge_plan(config_file: Path | None) -> int:
     """Print what a purge would delete, without deleting anything."""
     try:
-        plan = SnapshotManager(Config()).plan_purge()
+        plan = SnapshotManager(Config(config_file)).plan_purge()
     except PurgeError as err:
         print(f"Error: {err}", file=sys.stderr)
         return 1
@@ -1219,28 +1328,41 @@ def print_purge_plan() -> int:
 
 def main():
     """Main entry point."""
-    args = sys.argv[1:]
-    if args and args[0] in ("--version", "-V"):
-        print(f"btrbk_tui_pro {VERSION}")
-        return
-    if args and args[0] in ("--help", "-h"):
-        print(f"btrbk_tui_pro {VERSION} - restore Btrfs snapshots created with btrbk\n")
-        print("Usage: sudo ./btrbk_tui_pro.py [OPTION]\n")
-        print("  --purge-plan   show what Purge OLD would delete, then exit")
-        print("  -V, --version  show the version")
-        print("  -h, --help     show this help")
-        return
-    if args and args[0] != "--purge-plan":
-        print(f"Error: unknown option '{args[0]}' (try --help)", file=sys.stderr)
-        sys.exit(2)
+    purge_plan = False
+    config_file = None
+    args = iter(sys.argv[1:])
+    for arg in args:
+        if arg == "--purge-plan":
+            purge_plan = True
+        elif arg in ("--config", "-c"):
+            value = next(args, None)
+            if value is None:
+                print(f"Error: {arg} needs a file (try --help)", file=sys.stderr)
+                sys.exit(2)
+            config_file = Path(value)
+        elif arg in ("--version", "-V"):
+            print(f"btrbk_tui_pro {VERSION}")
+            return
+        elif arg in ("--help", "-h"):
+            print(f"btrbk_tui_pro {VERSION} - restore Btrfs snapshots created with btrbk\n")
+            print("Usage: sudo ./btrbk_tui_pro.py [OPTION]...\n")
+            print("  -c, --config FILE  use FILE as configuration (default: ~/.config/btrbk_tui/config.json")
+            print("                     of the user who ran sudo)")
+            print("  --purge-plan       show what Purge OLD would delete, then exit")
+            print("  -V, --version      show the version")
+            print("  -h, --help         show this help")
+            return
+        else:
+            print(f"Error: unknown option '{arg}' (try --help)", file=sys.stderr)
+            sys.exit(2)
 
     if os.geteuid() != 0:
         print("Error: This tool requires root privileges.")
         print("Please run with sudo.")
         sys.exit(1)
 
-    if args:
-        sys.exit(print_purge_plan())
+    if purge_plan:
+        sys.exit(print_purge_plan(config_file))
 
     # Without this curses cannot draw non-ASCII snapshot names
     with contextlib.suppress(locale.Error):
@@ -1249,7 +1371,7 @@ def main():
     os.environ.setdefault("ESCDELAY", "25")
 
     try:
-        app = TUIApp()
+        app = TUIApp(config_file)
         curses.wrapper(app.run)
     except KeyboardInterrupt:
         print("\nOperation cancelled by user.")

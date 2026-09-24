@@ -1,4 +1,16 @@
-# Latest Changes - BTRBK TUI v2.8
+# Latest Changes - BTRBK TUI v2.9
+
+## v2.9 - Qualsiasi layout btrbk (2026-09-24, dalle issue GitHub #1-#4)
+
+- **Nomi snapshot senza `@`**: `split_snapshot_name` accetta `<nome>.<timestamp>` se il timestamp è un timestamp btrbk valido (prima serviva `@`, che escludeva il naming di default di btrbk). Esclude `scripts.d`, `prune.sh`, `@home.BROKEN`.
+- **Config dell'utente dietro sudo/pkexec**: `config_candidates(invoking_home, home)` -> `<utente>/.config/btrbk_tui`, `/root/.config/btrbk_tui`, poi le stesse con `btrbk_restore` (nome della directory fino al 2025-09-23, rinominata senza migrazione: la vecchia config veniva ignorata in silenzio). Il vecchio path si legge ma non si scrive; salvando si sposta al nuovo, con `chown` all'utente (SUDO_UID/PKEXEC_UID, home via getpwuid). `invoking_user()`, `is_legacy_config()`.
+- **`--config FILE` / `-c`** in entrambe le TUI (utile anche per i test: niente più trucco `HOME=`).
+- **Dialogo di restore su due righe** con il path toccato: "Replaces <pool>/<sub> ..." oppure "WARNING: ... does not exist, it will be CREATED" (sintomo di btr_pool_dir che non è il top level). `confirm_dialog` accetta messaggi multi-riga.
+- **Verifica root/home per mount**: `mounted_subvolume(mountinfo, mountpoint)` legge /proc/self/mountinfo; controlli da root se il subvolume è "@" o quello montato su `/`, da home se "@home" o quello su `/home`.
+- **CLI**: importa da `btrbk_tui_pro` (Config, group_snapshots, split_snapshot_name, parse_btrbk_timestamp, mounted_subvolume, VERSION) invece di duplicare la logica: va eseguita dalla directory del repo accanto a `btrbk_tui_pro.py`.
+- 15 test per versione. README: sezione "Layout requirements" (btr_pool_dir = top level subvolid=5; snapshot fuori dai subvolumi, `/home/.snapshots` non è ripristinabile per swap).
+- Issue GitHub: risposte a tutte (#1-#5); #2 (esecuzione come utente non root) e #3 (più volumi letti da btrbk.conf) restano aperte come richieste di funzionalità.
+
 
 ## v2.8 - Audit della TUI Rust (2026-09-21)
 

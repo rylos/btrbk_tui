@@ -16,6 +16,22 @@ This project provides tools to easily restore Btrfs subvolume snapshots created 
 - System reboot with visual indicators
 - Optionally reboot the system after restoration
 
+## ✨ Features v2.9 - Works With Any btrbk Layout
+
+Fixes for the problems reported in the issue tracker, in all three versions.
+Verified on a throw-away loopback btrfs with a layout like the reported ones:
+subvolumes without `@`, the configuration at the old path in the user's home,
+the tool started with `sudo`.
+
+- **Snapshots no longer need an `@` prefix** ([#1](https://github.com/rylos/btrbk_tui/issues/1), [#4](https://github.com/rylos/btrbk_tui/issues/4)): btrbk names snapshots after the subvolume, so `home.20250901T0800` is as valid as `@home.20250901T0800`. A directory now counts as a snapshot when what follows its last dot is a btrbk timestamp, which also keeps out look-alikes such as `scripts.d` or `prune.sh`
+- **The configuration is found where users put it** ([#4](https://github.com/rylos/btrbk_tui/issues/4)): `sudo` resets `HOME` to `/root`, so a config created in your own `~/.config` was silently ignored. Under `sudo` or `pkexec` the tool now reads the invoking user's file first, and writes it back owned by that user
+- **The old configuration path is still read** ([#1](https://github.com/rylos/btrbk_tui/issues/1), [#4](https://github.com/rylos/btrbk_tui/issues/4)): the directory was renamed from `~/.config/btrbk_restore` to `~/.config/btrbk_tui` in September 2025 without a migration. The old file is read again; saving from the Settings screen moves it to the new name
+- **`--config FILE`** (`-c`): use a different configuration, for example one per btrbk volume ([#3](https://github.com/rylos/btrbk_tui/issues/3))
+- **The restore dialog names the path it will touch**: `Replaces /mnt/btr_pool/@home (the old one is kept as .BROKEN)`, or a warning when that subvolume does not exist and would be created — the symptom of a pool directory that is not the top level of the filesystem
+- **Root and home are recognised in any layout**: the strict checks after a restore (`/etc/fstab`, `/etc/passwd`, non-empty home) used to apply only to subvolumes called `@` and `@home`. They now also apply to whatever subvolume is mounted on `/` and `/home`, read from `/proc/self/mountinfo`
+- The CLI uses the same snapshot, timestamp and configuration code as the TUI instead of its own copy
+- **15 unit tests per version** (were 13)
+
 ## ✨ Features v2.8 - TUI Audit (Rust + Python)
 
 A full review of the Rust TUI, the version used day to day, then ported line for
@@ -164,7 +180,7 @@ The tool assumes by default:
 - **Btrfs Pool**: `/mnt/btr_pool`
 - **Snapshots directory**: `/mnt/btr_pool/btrbk_snapshots`
 
-**Shared Configuration**: The TUI Pro (Python) and Rust versions share the same JSON configuration file at `~/.config/btrbk_tui/config.json`, ensuring a completely consistent user experience.
+**Shared Configuration**: all three versions read the same JSON file, `~/.config/btrbk_tui/config.json` — in the home of the user who ran `sudo`, not in `/root` (see [Advanced Configuration](#advanced-configuration)).
 
 ## Usage
 
@@ -220,16 +236,37 @@ sudo ./target/release/btrbk_tui
 
 ## Supported Snapshot Structure
 
-The tool automatically handles snapshots with this nomenclature:
-- `@.YYYYMMDD_HHMMSS` - Root subvolume snapshot
-- `@home.YYYYMMDD_HHMMSS` - Home subvolume snapshot
-- `@games.YYYYMMDD_HHMMSS` - Games subvolume snapshot
-- `@custom.YYYYMMDD_HHMMSS` - Custom subvolume snapshots
-- `@backup.YYYYMMDD_HHMMSS` - Backup snapshots
-- `@work.YYYYMMDD_HHMMSS` - Work snapshots
-- **And any other prefix** that starts with `@` followed by a dot
+Every directory in `snapshots_dir` named `<subvolume>.<timestamp>` is a snapshot,
+whatever btrbk `timestamp_format` produced it and with or without `@`:
 
-**The tool automatically adapts** to any user's btrbk configuration!
+- `@.20260803T1405`, `@home.20260803T1405`, `@games.20260803T140559+0200`
+- `root.20260803T1405`, `home.20260803`, `data.20260803T1405_1`
+- legacy `@home.20260803_140559` names
+
+Snapshots are grouped into one column per subvolume. Restoring one replaces
+`<btr_pool_dir>/<subvolume>`.
+
+### Layout requirements
+
+Restoring works by swapping subvolumes, so two things must hold:
+
+1. **`btr_pool_dir` is the top level of the btrfs filesystem** (mounted with
+   `subvolid=5`), where the live subvolumes are direct children:
+   ```
+   /mnt/btr_pool/            <- btr_pool_dir, mounted with subvolid=5
+   ├── @  (or root)          <- mounted on /
+   ├── @home  (or home)      <- mounted on /home
+   └── btrbk_snapshots/      <- snapshots_dir
+   ```
+   Mounting it takes one line in `/etc/fstab`, e.g.
+   `UUID=<fs-uuid>  /mnt/btr_pool  btrfs  subvolid=5,noatime  0 0`.
+2. **Snapshots live outside the subvolumes they belong to.** A layout such as
+   `/home/.snapshots/home.20250901T0800` keeps the snapshots *inside* `/home`:
+   replacing `/home` would move them away with it. btrbk works the same with
+   `snapshot_dir` at the top level, which is also what makes a restore possible.
+
+If `btr_pool_dir` is not the top level, the restore dialog shows it: it warns
+that the subvolume it is about to replace does not exist and would be created.
 
 ## TUI Controls
 
@@ -323,10 +360,26 @@ update-desktop-database ~/.local/share/applications
 
 ## Advanced Configuration
 
-Both TUI versions (Python Pro and Rust) share the configuration saved at:
+All three versions share one configuration file. It is looked up in this order,
+and the first one found is used:
+
+1. `~/.config/btrbk_tui/config.json` of the user who ran `sudo` (or `pkexec`)
+2. `~/.config/btrbk_tui/config.json` of root
+3. the same two under `~/.config/btrbk_restore/`, the directory's name until
+   September 2025 — read only: saving from the Settings screen moves it to the
+   new name
+
+`sudo` resets `HOME` to `/root`; without rule 1 a file created in your own home
+would be ignored. A file written to your home is left owned by you.
+
+`--config FILE` (or `-c FILE`) skips the lookup and uses `FILE`, for example
+one configuration per btrbk volume:
+
+```bash
+sudo btrbk_tui --config /etc/btrbk_tui/backup-volume.json
 ```
-~/.config/btrbk_tui/config.json
-```
+
+The Settings screen shows which file is in use.
 
 ### Configurable settings:
 - **btr_pool_dir**: Btrfs pool directory (default: `/mnt/btr_pool`)
@@ -349,7 +402,7 @@ Both TUI versions (Python Pro and Rust) share the configuration saved at:
 ```
 
 ### Configuration Management:
-- **Automatic loading**: At startup of any TUI version
+- **Automatic loading**: At startup of every version, CLI included
 - **Automatic saving**: On every change in TUI versions
 - **Synchronization**: Changes in one version apply immediately to the other
 - **Fallback**: If file is corrupted or missing, default values are used
@@ -430,7 +483,7 @@ btrbk_tui/
 ### **Linting:**
 - **Python**: [`ruff`](https://docs.astral.sh/ruff/) — `ruff check .`
 - **Rust**: `cargo clippy` — both pass with zero warnings
-- **Tests**: `cargo test` (in `btrbk_tui_rust/`) and `python3 -m unittest discover -s tests -p '*_test.py'` — the same 13 cases on both sides
+- **Tests**: `cargo test` (in `btrbk_tui_rust/`) and `python3 -m unittest discover -s tests -p '*_test.py'` — the same 15 cases on both sides
 
 ### **Testing:**
 - Tested on Arch Linux with KDE Plasma 6

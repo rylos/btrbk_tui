@@ -77,8 +77,42 @@ class SnapshotNamesTest(unittest.TestCase):
         self.assertEqual(tui.split_snapshot_name("@home.20260803T0000"), ("@home", "20260803T0000"))
         self.assertEqual(tui.split_snapshot_name("@.20260803T0000_1"), ("@", "20260803T0000_1"))
         self.assertEqual(tui.split_snapshot_name("@my.data.20260803"), ("@my.data", "20260803"))
-        for not_a_snapshot in ("@home", "@home.", "scripts.d"):
+        # btrbk's default naming: the subvolume name, with or without "@"
+        self.assertEqual(tui.split_snapshot_name("home.20250901T0800"), ("home", "20250901T0800"))
+        # a dot alone does not make a snapshot: what follows must be a timestamp
+        for not_a_snapshot in ("home", "@home.", ".20250901T0800", "scripts.d",
+                               "prune_snapshots_keep_parent.sh", "@home.BROKEN"):
             self.assertIsNone(tui.split_snapshot_name(not_a_snapshot))
+
+    def test_config_belongs_to_the_user_behind_sudo(self):
+        candidates = tui.config_candidates(Path("/home/user"), Path("/root"))
+        self.assertEqual(candidates, [Path(p) for p in (
+            "/home/user/.config/btrbk_tui/config.json",
+            "/root/.config/btrbk_tui/config.json",
+            "/home/user/.config/btrbk_restore/config.json",
+            "/root/.config/btrbk_restore/config.json",
+        )])
+        self.assertTrue(tui.is_legacy_config(candidates[2]))
+        self.assertFalse(tui.is_legacy_config(candidates[0]))
+
+        # plain root login: no duplicates, and never a world-writable fallback
+        self.assertEqual(len(tui.config_candidates(None, Path("/root"))), 2)
+        self.assertEqual(tui.config_candidates(None, None)[0], Path("/root/.config/btrbk_tui/config.json"))
+
+    def test_mounted_subvolumes_come_from_mountinfo(self):
+        mountinfo = (
+            "23 1 0:21 /@ / rw,relatime shared:1 - btrfs /dev/nvme0n1p2 rw,subvol=/@\n"
+            "24 23 0:21 /@home /home rw,relatime shared:2 - btrfs /dev/nvme0n1p2 rw,subvol=/@home\n"
+            "25 23 0:21 / /mnt/btr_pool rw,relatime shared:3 - btrfs /dev/nvme0n1p2 rw,subvolid=5\n"
+            "26 23 0:22 / /tmp rw shared:4 - tmpfs tmpfs rw\n"
+            "27 24 0:21 /home /home rw,relatime shared:5 - btrfs /dev/sda1 rw,subvol=/home\n"
+        )
+        self.assertEqual(tui.mounted_subvolume(mountinfo, "/"), "@")
+        # mounted twice: the later mount hides the earlier one
+        self.assertEqual(tui.mounted_subvolume(mountinfo, "/home"), "home")
+        self.assertEqual(tui.mounted_subvolume(mountinfo, "/mnt/btr_pool"), "")
+        self.assertIsNone(tui.mounted_subvolume(mountinfo, "/tmp"))  # noqa: S108 (a mountpoint, not a file)
+        self.assertIsNone(tui.mounted_subvolume(mountinfo, "/var"))
 
     def test_groups_put_root_first_and_newest_on_top(self):
         groups = tui.group_snapshots([

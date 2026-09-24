@@ -1,82 +1,53 @@
 #!/usr/bin/python
-import json
 import os
 import subprocess
 import sys
 from datetime import datetime
-from pathlib import Path
+
+# Snapshot naming, timestamps, config lookup and mount detection are shared
+# with the TUI, so that the three versions agree on all of them
+from btrbk_tui_pro import (
+    VERSION,
+    Config,
+    group_snapshots,
+    mounted_subvolume,
+    parse_btrbk_timestamp,
+    split_snapshot_name,
+)
 
 # Configura le cartelle (default; sovrascritte dalla config condivisa se presente)
 btr_pool_dir = "/mnt/btr_pool"
 snapshots_dir = "/mnt/btr_pool/btrbk_snapshots"
 
-# File di configurazione condiviso con le versioni TUI
-CONFIG_FILE = Path.home() / ".config" / "btrbk_tui" / "config.json"
-
 def load_config():
-    """Carica btr_pool_dir e snapshots_dir dalla config condivisa, se presente."""
+    """Carica btr_pool_dir e snapshots_dir dalla config condivisa con le TUI.
+
+    Stessa ricerca delle TUI: sotto sudo la config dell'utente che ha lanciato
+    sudo, poi quella di root, poi il vecchio percorso ~/.config/btrbk_restore.
+    """
     global btr_pool_dir, snapshots_dir
-    try:
-        if CONFIG_FILE.exists():
-            with open(CONFIG_FILE) as f:
-                data = json.load(f)
-            btr_pool_dir = data.get("btr_pool_dir", btr_pool_dir)
-            snapshots_dir = data.get("snapshots_dir", snapshots_dir)
-    except Exception:
-        pass  # In caso di config corrotta si usano i default
+    config = Config()
+    btr_pool_dir = config.get("btr_pool_dir", btr_pool_dir)
+    snapshots_dir = config.get("snapshots_dir", snapshots_dir)
 
 def get_snapshot_groups():
-    """Get snapshots organized by type (dynamically detected)."""
+    """Get snapshots grouped by subvolume, "@" first, newest first."""
     try:
-        # Get all snapshot directories and extract prefixes
-        all_items = os.listdir(snapshots_dir)
-        snapshot_groups = {}
-
-        for item in all_items:
-            item_path = os.path.join(snapshots_dir, item)
-            # Extract prefix (everything before the first dot)
-            if os.path.isdir(item_path) and '.' in item:
-                prefix = item.split('.')[0]
-                if prefix.startswith('@'):  # Only consider btrfs subvolumes
-                    if prefix not in snapshot_groups:
-                        snapshot_groups[prefix] = []
-                    snapshot_groups[prefix].append(item)
-
-        # Sort each group by name (which corresponds to timestamp)
-        for snapshots in snapshot_groups.values():
-            snapshots.sort(reverse=True)  # Newest first
-
-        return snapshot_groups
-
+        names = [item for item in os.listdir(snapshots_dir)
+                 if os.path.isdir(os.path.join(snapshots_dir, item))]
     except FileNotFoundError:
         print(f"Error: Directory {snapshots_dir} not found!")
         sys.exit(1)
-    except Exception as e:
+    except OSError as e:
         print(f"Error reading snapshots: {e}")
         sys.exit(1)
+    return group_snapshots(names)
 
 def format_snapshot_name(snapshot):
     """Format snapshot name with timestamp (optional)."""
-    try:
-        if '.' in snapshot and snapshot.startswith('@'):
-            # Find the prefix and extract timestamp
-            prefix = snapshot.split('.')[0]
-            timestamp_str = snapshot[len(prefix) + 1:]  # +1 for the dot
-
-            # Try multiple timestamp formats
-            try:
-                dt = datetime.strptime(timestamp_str, "%Y%m%dT%H%M")
-                return f"{snapshot} ({dt.strftime('%Y-%m-%d %H:%M:%S')})"
-            except ValueError:
-                try:
-                    dt = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
-                    return f"{snapshot} ({dt.strftime('%Y-%m-%d %H:%M:%S')})"
-                except ValueError:
-                    return snapshot
-        else:
-            return snapshot
-    except (ValueError, IndexError):
-        return snapshot
+    parts = split_snapshot_name(snapshot)
+    dt = parse_btrbk_timestamp(parts[1]) if parts else None
+    return f"{snapshot} ({dt.strftime('%Y-%m-%d %H:%M:%S')})" if dt else snapshot
 
 def display_snapshots(snapshot_groups):
     """Display snapshots organized by groups."""
@@ -90,11 +61,7 @@ def display_snapshots(snapshot_groups):
     snapshot_list = []
     counter = 1
 
-    # Sort prefixes for consistent ordering (@ first, then alphabetically)
-    sorted_prefixes = sorted(snapshot_groups.keys(), key=lambda x: (x != '@', x))
-
-    for prefix in sorted_prefixes:
-        snapshots = snapshot_groups[prefix]
+    for prefix, snapshots in snapshot_groups:
         print(f"\n--- {prefix.upper()} ({len(snapshots)} snapshots) ---")
 
         for snapshot in snapshots:
@@ -115,14 +82,24 @@ def verify_restore_success(target_path, prefix):
                       capture_output=True).returncode != 0:
         return False
 
-    if prefix == '@':
+    # Root e home si riconoscono dal nome "@"/"@home" o da ciò che è montato
+    # su / e /home: nei layout senza "@" si chiamano root, rootfs, home...
+    try:
+        with open("/proc/self/mountinfo") as f:
+            mountinfo = f.read()
+    except OSError:
+        mountinfo = ""
+    is_root = prefix == '@' or mounted_subvolume(mountinfo, "/") == prefix
+    is_home = prefix == '@home' or mounted_subvolume(mountinfo, "/home") == prefix
+
+    if is_root:
         for d in ["etc", "usr", "var", "bin"]:
             if not os.path.exists(os.path.join(target_path, d)):
                 return False
         for f in ["etc/fstab", "etc/passwd"]:
             if not os.path.isfile(os.path.join(target_path, f)):
                 return False
-    elif prefix == '@home':
+    elif is_home:
         try:
             if not os.listdir(target_path):
                 return False
@@ -223,7 +200,7 @@ def main():
         print("❌ Errore: questo strumento richiede privilegi di root. Esegui con sudo.")
         sys.exit(1)
 
-    print("🔄 BTRBK TUI v2.8 - Versione CLI Dinamica")
+    print(f"🔄 BTRBK TUI v{VERSION} - Versione CLI Dinamica")
     print("=" * 50)
 
     # Carica la configurazione condivisa con le versioni TUI

@@ -1,4 +1,4 @@
-# Struttura Codebase - BTRBK TUI v2.8
+# Struttura Codebase - BTRBK TUI v2.9
 
 ## Layout Directory
 ```
@@ -66,6 +66,6 @@ btrbk_tui/
 Dettagli e motivazione: `mem:latest_changes`
 
 ## Config Condivisa
-- Path: `~/.config/btrbk_tui/config.json`
+- Ricerca (`config_candidates`): `~<utente dietro sudo/pkexec>/.config/btrbk_tui/config.json`, `/root/.config/btrbk_tui/...`, poi gli stessi in `btrbk_restore/` (sola lettura). `--config FILE` salta la ricerca. Salvata come root nella home dell'utente -> chown all'utente
 - Campi: btr_pool_dir, snapshots_dir, auto_cleanup, confirm_actions, show_timestamps, theme
 - Tutte e tre le versioni la leggono (CLI inclusa da v2.6)
