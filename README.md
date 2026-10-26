@@ -603,3 +603,7 @@ The dynamic interface automatically adapts to your btrbk configuration:
 ---
 
 **Made with ❤️ for the Btrfs and btrbk community**
+
+## License
+
+MIT, see [LICENSE](LICENSE).
