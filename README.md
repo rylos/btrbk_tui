@@ -28,7 +28,7 @@ This project provides tools to easily restore Btrfs subvolume snapshots created 
   writable by group or others (a symlink is judged by its target), inside a
   directory with the same rules. Hidden files, `~` backups and `.pacnew`/`.bak`
   leftovers are skipped
-- **What it is for**: btrbk-nas, a Synology package that shows the backups a
+- **What it is for**: [btrbk-nas](https://github.com/rylos/btrbk-nas), a Synology package that shows the backups a
   NAS receives, ships `btrbk-nas-push-uuids`, which tells the NAS which snapshots the PC still holds, so the
   NAS can show btrbk's next incremental parent. A purge from the TUI or a run
   started with `I` (which does not go through `btrbk.service`) would otherwise

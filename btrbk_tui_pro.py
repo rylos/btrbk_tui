@@ -520,14 +520,14 @@ class SnapshotManager:
         deriving it from a type name would map a subvolume called @root onto @.
 
         Returns (outcome, reason), outcome being one of:
-            "success"         - restore completato e verificato
-            "failed"          - restore fallito ma rollback riuscito (stato precedente ripristinato)
-            "rollback_failed" - restore fallito E rollback fallito (stato incoerente, .BROKEN conservato)
+            "success"         - restore completed and verified
+            "failed"          - restore failed but rollback succeeded (previous state restored)
+            "rollback_failed" - restore failed AND rollback failed (inconsistent state, .BROKEN kept)
         """
         btr_pool_dir = self.config.get("btr_pool_dir")
         source_path = os.path.join(self.config.get("snapshots_dir"), snapshot)
 
-        # Pre-check: lo snapshot sorgente deve esistere prima di toccare il subvolume corrente
+        # Pre-check: the source snapshot must exist before touching the current subvolume
         if not os.path.exists(source_path):
             return "failed", f"{source_path} no longer exists"
 
@@ -538,8 +538,8 @@ class SnapshotManager:
         current_existed = os.path.exists(current_subvol)
 
         if current_existed:
-            # Guardia: deve essere un vero subvolume btrfs prima di spostarlo
-            # (evita di spostare una directory normale per errore)
+            # Guard: it must be a real btrfs subvolume before moving it
+            # (avoids moving a plain directory by mistake)
             reason = run_command(["btrfs", "subvolume", "show", current_subvol])
             if reason:
                 return "failed", f"{current_subvol} is not a btrfs subvolume: {reason}"
@@ -548,15 +548,15 @@ class SnapshotManager:
             if os.path.exists(broken_subvol):
                 return "failed", f"{broken_subvol} already exists"
 
-            # Move current to .BROKEN. rename(2) e non mv: tra filesystem
-            # diversi fallisce, invece di mettersi a copiare un subvolume
+            # Move current to .BROKEN. rename(2) rather than mv: across
+            # filesystems it fails instead of starting to copy a subvolume
             try:
                 os.rename(current_subvol, broken_subvol)
             except OSError as err:
                 return "failed", f"cannot move {subvol_name}: {err}"
 
         def roll_back(reason: str) -> tuple[str, str]:
-            """Rimette al suo posto il subvolume originale."""
+            """Put the original subvolume back in place."""
             if current_existed:
                 try:
                     os.rename(broken_subvol, current_subvol)
@@ -572,15 +572,15 @@ class SnapshotManager:
         # Verify restore success
         reason = self._verify_restore_success(current_subvol, subvol_name)
         if reason:
-            # Rollback completo: rimuovi il subvolume fallito e ripristina l'originale
+            # Full rollback: remove the failed subvolume and restore the original
             err = run_command(["btrfs", "subvolume", "delete", current_subvol])
             if err:
-                # Il subvolume fallito occupa ancora il path: impossibile ripristinare l'originale
+                # The failed subvolume still holds the path: the original cannot go back
                 return "rollback_failed", (f"{reason}; cannot remove the failed restore ({err}), "
                                            f"original kept as {broken_subvol}")
             return roll_back(reason)
 
-        # Auto cleanup if enabled (solo se avevamo un originale da rimuovere)
+        # Auto cleanup if enabled (only if there was an original to remove)
         if self.config.get("auto_cleanup", False) and current_existed:
             run_command(["btrfs", "subvolume", "delete", broken_subvol])
 
@@ -763,18 +763,18 @@ class TUIApp:
         self.status_message = ""
         self.status_until = 0.0
         self.reboot_needed = False  # Track if reboot is needed
-        # Cache degli snapshot: evita di rileggere il filesystem ad ogni frame.
-        # None = cache invalidata (verrà ricalcolata al prossimo accesso).
+        # Snapshot cache: avoids rereading the filesystem on every frame.
+        # None = cache invalidated (recomputed on the next access).
         self._snapshot_cache: list[tuple[str, list[str]]] | None = None
 
     def get_snapshots_cached(self) -> list[tuple[str, list[str]]]:
-        """Restituisce gli snapshot dalla cache, ricalcolandoli solo se invalidata."""
+        """Return the cached snapshots, recomputing them only if invalidated."""
         if self._snapshot_cache is None:
             self._snapshot_cache = self.snapshot_manager.get_snapshots()
         return self._snapshot_cache
 
     def invalidate_snapshots(self):
-        """Invalida la cache: il prossimo accesso rileggerà il filesystem."""
+        """Invalidate the cache: the next access rereads the filesystem."""
         self._snapshot_cache = None
 
     def init_colors(self):
@@ -1140,7 +1140,7 @@ class TUIApp:
         elif os.path.isdir(new_path):
             self.set_status(f"Updated {key}", STATUS_MEDIUM)
         else:
-            # Avvisa se un path di directory non esiste
+            # Warn if a directory path does not exist
             self.set_status(f"Updated {key} (WARNING: path does not exist)", STATUS_LONG)
 
     def toggle_setting(self, key: str):

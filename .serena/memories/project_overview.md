@@ -1,41 +1,41 @@
 # BTRBK TUI v2.10 - Project Overview
 
-## Scopo
-Set completo di strumenti per il ripristino di snapshot Btrfs creati con btrbk. Tre implementazioni con interfacce diverse, configurazione condivisa e parità di funzionalità.
+## Purpose
+Complete toolset for restoring Btrfs snapshots created with btrbk. Three implementations with different interfaces, a shared configuration and feature parity.
 
-### Versioni Disponibili
-- **`btrbk_tui.py`** - CLI semplice con menu numerato
-- **`btrbk_tui_pro.py`** - TUI professionale Python con curses
-- **`btrbk_tui_rust/`** - TUI Rust ad alte prestazioni (identica alla Pro)
+### Available Versions
+- **`btrbk_tui.py`** - simple CLI with a numbered menu
+- **`btrbk_tui_pro.py`** - professional Python TUI with curses
+- **`btrbk_tui_rust/`** - high-performance Rust TUI (identical to Pro)
 
-### Comandi TUI (Schermata Principale)
-- **↑↓**: Navigazione snapshot | **←→**: Cambio colonna
-- **ENTER**: Seleziona e ripristina | **S**: Settings | **R**: Refresh
-- **I**: Crea snapshot (`btrbk run --progress`) | **P**: Purge OLD | **B**: Clean BROKEN
-- **H**: Reboot (dopo restore) | **Q**: Esci
+### TUI Commands (Main Screen)
+- **↑↓**: Navigate snapshots | **←→**: Switch column
+- **ENTER**: Select and restore | **S**: Settings | **R**: Refresh
+- **I**: Create snapshot (`btrbk run --progress`) | **P**: Purge OLD | **B**: Clean BROKEN
+- **H**: Reboot (after restore) | **Q**: Quit
 
-### Comandi TUI (Settings)
-- **↑↓**: Naviga | **ENTER**: Modifica stringa | **SPACE**: Toggle booleano
-- **S**: Salva manuale | **ESC**: Torna a main
+### TUI Commands (Settings)
+- **↑↓**: Navigate | **ENTER**: Edit string | **SPACE**: Toggle boolean
+- **S**: Manual save | **ESC**: Back to main
 
-### Funzionalità Chiave
-- Rilevamento dinamico qualsiasi @prefix
-- Colonne adattive, ordinamento @ primo poi alfabetico
-- Config condivisa `~/.config/btrbk_tui/config.json`
-- Restore sicuro: mv → snapshot → verify → rollback se fallisce
-- Backup `.BROKEN.TIMESTAMP` unici
-- Messaggi status specifici per ogni operazione
-- Purge chain-aware (v2.7, solo TUI Python e Rust): interroga il target ssh di btrbk e non cancella mai il parent snapshot del prossimo send incrementale; fail-safe se il target è irraggiungibile (vedi `mem:latest_changes`)
-- Desktop entry `btrbk-tui.desktop` (pkexec sulla TUI Rust)
-- Repo pubblico su GitHub: niente dati reali di rete/host nel codice o nei test
+### Key Features
+- Dynamic detection of any @prefix
+- Adaptive columns, sorted with @ first then alphabetically
+- Shared config `~/.config/btrbk_tui/config.json`
+- Safe restore: mv → snapshot → verify → rollback on failure
+- Unique `.BROKEN.TIMESTAMP` backups
+- Specific status messages for every operation
+- Chain-aware purge (v2.7, Python and Rust TUIs only): queries btrbk's ssh target and never deletes the parent snapshot of the next incremental send; fail-safe if the target is unreachable (see `mem:latest_changes`)
+- Desktop entry `btrbk-tui.desktop` (pkexec on the Rust TUI)
+- Public repo on GitHub: no real network/host data in code or tests
 
-- `--purge-plan` (dry run della purge) in entrambe le TUI; Home/End; scroll delle colonne
-- Uso quotidiano: `sudo btrbk_tui` = TUI Rust (symlink /usr/local/bin)
+- `--purge-plan` (purge dry run) in both TUIs; Home/End; column scrolling
+- Daily use: `sudo btrbk_tui` = Rust TUI (symlink in /usr/local/bin)
 
-- Snapshot riconosciuti con o senza `@` (timestamp btrbk dopo l'ultimo punto); `--config FILE`
+- Snapshots recognised with or without `@` (btrbk timestamp after the last dot); `--config FILE`
 
-### Stato: Tutte le versioni ✅ Produzione v2.10 (2026-10-26)
-- v2.10: hook root-only in `/etc/btrbk_tui/post-change.d/` dopo purge e `btrbk run` (vedi `mem:latest_changes`)
+### Status: All versions ✅ Production v2.10 (2026-10-26)
+- v2.10: root-only hooks in `/etc/btrbk_tui/post-change.d/` after purge and `btrbk run` (see `mem:latest_changes`)
 
-### Documentazione esterna
-Nota wiki Joplin dedicata (notebook Backup & Storage): «BTRBK TUI — restore, purge e snapshot btrbk da terminale», id `5e37ad8b6c5542138e3d94ce6903de3c`. Va aggiornata quando cambiano tasti, opzioni da shell o il flusso di restore/purge (poi `wiki log` e `wiki brief --write`).
+### External documentation
+The author's private Joplin wiki has a dedicated note on this tool (notebook Backup & Storage, id `5e37ad8b6c5542138e3d94ce6903de3c`). Update it when keys, shell options or the restore/purge flow change (then `wiki log` and `wiki brief --write`).

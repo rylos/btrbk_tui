@@ -1,97 +1,97 @@
 # Latest Changes - BTRBK TUI v2.10
 
-## v2.10 - Hook dopo le modifiche agli snapshot (2026-10-26)
+## v2.10 - Hooks after the snapshots change (2026-10-26)
 
-- Dopo una purge che ha cancellato qualcosa e dopo ogni `btrbk run` lanciato con `I` (riuscito o no), Rust e Python eseguono i programmi in `/etc/btrbk_tui/post-change.d/` in ordine di nome, come run-parts. Un hook fallito è nominato nella barra di stato.
-- Solo hook di root: file regolare eseguibile di proprietà di root, non scrivibile da gruppo/altri (un symlink conta per il suo bersaglio), in una cartella con le stesse regole. Volutamente NON un'opzione della config utente: la TUI gira come root e un comando letto dalla home dell'utente sarebbe un'escalation.
-- Funzioni pure testate: `hook_allowed(uid, mode, is_file)`, `hook_name_allowed(name)`; I/O: `post_change_hooks(dir)`, `App::run_post_change_hooks` / `TUIApp.run_post_change_hooks`. 16 test per versione.
-- Uso su pc-casa: `/etc/btrbk_tui/post-change.d/50-btrbk-nas` -> `/usr/local/bin/btrbk-nas-push-uuids` (progetto btrbk-nas, `~/dev/btrbk-nas` su pc-work): aggiorna sul NAS l'elenco degli snapshot del PC, da cui l'app DSM calcola il prossimo parent. `I` non passa da btrbk.service, quindi senza hook l'elenco resterebbe indietro.
+- After a purge that deleted something and after every `btrbk run` started with `I` (successful or not), Rust and Python run the programs in `/etc/btrbk_tui/post-change.d/` in name order, like run-parts. A failed hook is named in the status bar.
+- Root hooks only: a regular executable file owned by root, not writable by group/others (a symlink counts as its target), in a directory with the same rules. Deliberately NOT a user config option: the TUI runs as root and a command read from the user's home would be an escalation.
+- Tested pure functions: `hook_allowed(uid, mode, is_file)`, `hook_name_allowed(name)`; I/O: `post_change_hooks(dir)`, `App::run_post_change_hooks` / `TUIApp.run_post_change_hooks`. 16 tests per version.
+- Use on the author's desktop: `/etc/btrbk_tui/post-change.d/50-btrbk-nas` -> `/usr/local/bin/btrbk-nas-push-uuids` (btrbk-nas project): updates on the NAS the list of the PC's snapshots, from which the DSM app works out the next parent. `I` does not go through btrbk.service, so without the hook the list would fall behind.
 
-## v2.9 - Qualsiasi layout btrbk (2026-09-24, dalle issue GitHub #1-#4)
+## v2.9 - Any btrbk layout (2026-09-24, from GitHub issues #1-#4)
 
-- **Nomi snapshot senza `@`**: `split_snapshot_name` accetta `<nome>.<timestamp>` se il timestamp è un timestamp btrbk valido (prima serviva `@`, che escludeva il naming di default di btrbk). Esclude `scripts.d`, `prune.sh`, `@home.BROKEN`.
-- **Config dell'utente dietro sudo/pkexec**: `config_candidates(invoking_home, home)` -> `<utente>/.config/btrbk_tui`, `/root/.config/btrbk_tui`, poi le stesse con `btrbk_restore` (nome della directory fino al 2025-09-23, rinominata senza migrazione: la vecchia config veniva ignorata in silenzio). Il vecchio path si legge ma non si scrive; salvando si sposta al nuovo, con `chown` all'utente (SUDO_UID/PKEXEC_UID, home via getpwuid). `invoking_user()`, `is_legacy_config()`.
-- **`--config FILE` / `-c`** in entrambe le TUI (utile anche per i test: niente più trucco `HOME=`).
-- **Dialogo di restore su due righe** con il path toccato: "Replaces <pool>/<sub> ..." oppure "WARNING: ... does not exist, it will be CREATED" (sintomo di btr_pool_dir che non è il top level). `confirm_dialog` accetta messaggi multi-riga.
-- **Verifica root/home per mount**: `mounted_subvolume(mountinfo, mountpoint)` legge /proc/self/mountinfo; controlli da root se il subvolume è "@" o quello montato su `/`, da home se "@home" o quello su `/home`.
-- **CLI**: importa da `btrbk_tui_pro` (Config, group_snapshots, split_snapshot_name, parse_btrbk_timestamp, mounted_subvolume, VERSION) invece di duplicare la logica: va eseguita dalla directory del repo accanto a `btrbk_tui_pro.py`.
-- 15 test per versione. README: sezione "Layout requirements" (btr_pool_dir = top level subvolid=5; snapshot fuori dai subvolumi, `/home/.snapshots` non è ripristinabile per swap).
-- Issue GitHub: risposte a tutte (#1-#5); #2 (esecuzione come utente non root) e #3 (più volumi letti da btrbk.conf) restano aperte come richieste di funzionalità.
-- **Prima release GitHub**: v2.9.0 (tag su 6f3c6c2) con binario Rust x86_64 ridotto con strip + `.sha256`. #5 chiusa, #1/#4 etichettate `bug` e aperte in attesa di conferma, #2/#3 `enhancement`.
+- **Snapshot names without `@`**: `split_snapshot_name` accepts `<name>.<timestamp>` if the timestamp is a valid btrbk timestamp (before, `@` was required, which excluded btrbk's default naming). Excludes `scripts.d`, `prune.sh`, `@home.BROKEN`.
+- **User config behind sudo/pkexec**: `config_candidates(invoking_home, home)` -> `<user>/.config/btrbk_tui`, `/root/.config/btrbk_tui`, then the same with `btrbk_restore` (directory name until 2025-09-23, renamed without migration: the old config was silently ignored). The old path is read but not written; saving moves it to the new one, with `chown` to the user (SUDO_UID/PKEXEC_UID, home via getpwuid). `invoking_user()`, `is_legacy_config()`.
+- **`--config FILE` / `-c`** in both TUIs (also handy for tests: no more `HOME=` trick).
+- **Two-line restore dialog** with the path touched: "Replaces <pool>/<sub> ..." or "WARNING: ... does not exist, it will be CREATED" (symptom of a btr_pool_dir that is not the top level). `confirm_dialog` accepts multi-line messages.
+- **Root/home check by mount**: `mounted_subvolume(mountinfo, mountpoint)` reads /proc/self/mountinfo; root checks if the subvolume is "@" or the one mounted on `/`, home checks if "@home" or the one on `/home`.
+- **CLI**: imports from `btrbk_tui_pro` (Config, group_snapshots, split_snapshot_name, parse_btrbk_timestamp, mounted_subvolume, VERSION) instead of duplicating the logic: it must run from the repo directory next to `btrbk_tui_pro.py`.
+- 15 tests per version. README: "Layout requirements" section (btr_pool_dir = top level subvolid=5; snapshots outside the subvolumes, `/home/.snapshots` cannot be restored by swap).
+- GitHub issues: all answered (#1-#5); #2 (running as a non-root user) and #3 (several volumes read from btrbk.conf) stay open as feature requests.
+- **First GitHub release**: v2.9.0 (tag on 6f3c6c2) with a stripped x86_64 Rust binary + `.sha256`. #5 closed, #1/#4 labelled `bug` and open awaiting confirmation, #2/#3 `enhancement`.
 
 
-## v2.8 - Audit della TUI Rust (2026-09-21)
+## v2.8 - Rust TUI audit (2026-09-21)
 
-`btrbk_tui` (symlink /usr/local/bin -> target/release) è la versione usata ogni giorno: main.rs riscritto in modo coerente (~1850 righe, 13 unit test). Dettaglio completo nel README, sezione v2.8.
+`btrbk_tui` (symlink /usr/local/bin -> target/release) is the version used every day: main.rs rewritten consistently (~1850 lines, 13 unit tests). Full details in the README, v2.8 section.
 
-### Sicurezza
-- **`@root` veniva ripristinato sopra `@`** (Rust + Python TUI): il subvolume era derivato da un "tipo" e il tipo di `@` era "root". Ora `restore_snapshot(snapshot, subvol_name)` riceve il prefisso così com'è; verify fa match su "@" / "@home". La CLI era già corretta.
-- ESC durante `btrbk run`: btrbk gira in una sessione propria (`setsid` in pre_exec, stdin null); ESC manda SIGINT al gruppo, SIGKILL dopo 5 s, e SIGKILL finale ai processi rimasti. Prima si uccideva solo btrbk lasciando orfani btrfs send/ssh come root.
-- `fs::rename` al posto di `mv` (tra filesystem diversi fallisce invece di copiare); controllo che .BROKEN non esista già.
-- Fallback config `/root` e non `/tmp`; panic hook che chiama `endwin()`.
+### Safety
+- **`@root` was restored over `@`** (Rust + Python TUI): the subvolume was derived from a "type" and the type of `@` was "root". Now `restore_snapshot(snapshot, subvol_name)` gets the prefix as-is; verify matches on "@" / "@home". The CLI was already correct.
+- ESC during `btrbk run`: btrbk runs in its own session (`setsid` in pre_exec, stdin null); ESC sends SIGINT to the group, SIGKILL after 5 s, and a final SIGKILL to the processes left. Before, only btrbk was killed, leaving orphaned btrfs send/ssh running as root.
+- `fs::rename` instead of `mv` (across filesystems it fails instead of copying); check that .BROKEN does not exist already.
+- Config fallback `/root`, not `/tmp`; panic hook that calls `endwin()`.
 
-### Bug
-- I messaggi "busy" non venivano mai disegnati (set_status + refresh senza draw) -> `show_busy()` ridisegna prima di bloccare.
-- Senza snapshot ogni tasto era ignorato (anche S e I).
-- Selezione fuori schermo: ora la colonna selezionata scorre (`[5-7 of 12]`), `clamp_selection`, Home/End.
-- Output btrbk diviso solo su `\n`: progress con `\r` non live. Ora `forward_stream` divide su entrambi e `OutputLog` sostituisce le righe transitorie.
-- Race che saltava la schermata "press any key"; ESCDELAY a 25 ms; header fermo a v2.6 (ora `CARGO_PKG_VERSION`).
-- `#[serde(default)]` su Config; salvataggi config falliti segnalati.
+### Bugs
+- "busy" messages were never drawn (set_status + refresh without draw) -> `show_busy()` redraws before blocking.
+- Without snapshots every key was ignored (S and I too).
+- Off-screen selection: now the selected column scrolls (`[5-7 of 12]`), `clamp_selection`, Home/End.
+- btrbk output split only on `\n`: progress with `\r` not live. Now `forward_stream` splits on both and `OutputLog` replaces transient lines.
+- Race that skipped the "press any key" screen; ESCDELAY at 25 ms; header stuck at v2.6 (now `CARGO_PKG_VERSION`).
+- `#[serde(default)]` on Config; failed config saves reported.
 
-### Migliorie
-- Purge: prima controlla il target, poi chiede conferma col numero reale; segnala cancellazioni fallite e subvolumi saltati. `sudo btrbk_tui --purge-plan` = dry run (anche `--version`, `--help`).
-- `parse_ssh_target`: onora ssh_identity/ssh_user/ssh_port di btrbk.conf, IPv6, `target send-receive ssh://`.
-- `run_command -> Result<(), String>` (ultima riga di stderr): gli errori dicono il perché. `RestoreOutcome::Failed(String)` / `RollbackFailed(String)`.
-- `erase()` al posto di `clear()` (niente flicker); tutto il disegno passa da `put()` che ritaglia -> nessun panic a qualsiasi dimensione del terminale.
-- Status a durata fissa (`Instant`, costanti `STATUS_*`), `Screen` enum, `key_char()` al posto dei codici numerici, cache `Rc<SnapshotGroups>`.
-- Timestamp: formati short/long/long-iso e suffisso `_N`; nome snapshot diviso all'ULTIMO punto (`split_snapshot_name`).
-- Messaggi di esito in ASCII (`[OK]`/`[FAILED]`): sotto pkexec il locale è C.
+### Improvements
+- Purge: checks the target first, then asks for confirmation with the real count; reports failed deletions and skipped subvolumes. `sudo btrbk_tui --purge-plan` = dry run (also `--version`, `--help`).
+- `parse_ssh_target`: honours ssh_identity/ssh_user/ssh_port from btrbk.conf, IPv6, `target send-receive ssh://`.
+- `run_command -> Result<(), String>` (last line of stderr): errors say why. `RestoreOutcome::Failed(String)` / `RollbackFailed(String)`.
+- `erase()` instead of `clear()` (no flicker); all drawing goes through `put()`, which clips -> no panic at any terminal size.
+- Fixed-duration status (`Instant`, `STATUS_*` constants), `Screen` enum, `key_char()` instead of numeric codes, `Rc<SnapshotGroups>` cache.
+- Timestamps: short/long/long-iso formats and `_N` suffix; snapshot name split at the LAST dot (`split_snapshot_name`).
+- Outcome messages in ASCII (`[OK]`/`[FAILED]`): under pkexec the locale is C.
 
-### Come è stato verificato (riutilizzabile)
-- Restore/rollback/clean: btrfs in loopback (truncate + mkfs.btrfs + mount -o loop), config via `sudo env HOME=<dir>`, TUI pilotata con `tmux send-keys` / `capture-pane`.
-- Creazione snapshot e ESC: finto `btrbk` in testa al PATH (`sudo env PATH=...`).
-- Purge: `--purge-plan` contro il target reale (sola lettura).
+### How it was verified (reusable)
+- Restore/rollback/clean: btrfs on loopback (truncate + mkfs.btrfs + mount -o loop), config via `sudo env HOME=<dir>`, TUI driven with `tmux send-keys` / `capture-pane`.
+- Snapshot creation and ESC: fake `btrbk` at the front of PATH (`sudo env PATH=...`).
+- Purge: `--purge-plan` against the real target (read only).
 
-### TUI Python portata in parità (stesso giorno)
-`btrbk_tui_pro.py` riscritto come port 1:1 della versione Rust: stesse funzioni pure a livello di modulo (`clean_output_line`, `split_snapshot_name`, `group_snapshots`, `parse_btrbk_timestamp`, `compute_purge_plan`, `parse_ssh_target`, ...), `OutputLog`, `StreamSplitter`, `put()`, `show_busy`, `clamp_selection`, scroll, `--purge-plan`/`--version`/`--help`, `os.rename`, `start_new_session=True` + `os.killpg`.
-- Bug solo Python corretti: `process.stdout.readline()` bloccava l'interfaccia (ESC ignorato fino alla riga successiva) -> ora `select` + `os.read` non bloccanti; dopo la creazione snapshot `nodelay(False)` faceva perdere il `timeout(100)` del loop principale (status congelati finché non si premeva un tasto).
-- `restore_snapshot` ritorna `(outcome, reason)`; `plan_purge` solleva `PurgeError`; `run_command` ritorna `None` o il motivo.
-- Test: `tests/parsing_test.py` (13 casi speculari a quelli Rust). ATTENZIONE: `.gitignore` esclude `test_*`, per questo il file NON si chiama `test_parsing.py`; si lancia con `python3 -m unittest discover -s tests -p '*_test.py'`.
-- La CLI (`btrbk_tui.py`) è invariata a parte la stringa di versione: non ha purge né creazione snapshot, e il mapping del prefisso era già corretto.
+### Python TUI brought to parity (same day)
+`btrbk_tui_pro.py` rewritten as a 1:1 port of the Rust version: same module-level pure functions (`clean_output_line`, `split_snapshot_name`, `group_snapshots`, `parse_btrbk_timestamp`, `compute_purge_plan`, `parse_ssh_target`, ...), `OutputLog`, `StreamSplitter`, `put()`, `show_busy`, `clamp_selection`, scrolling, `--purge-plan`/`--version`/`--help`, `os.rename`, `start_new_session=True` + `os.killpg`.
+- Python-only bugs fixed: `process.stdout.readline()` blocked the interface (ESC ignored until the next line) -> now non-blocking `select` + `os.read`; after snapshot creation `nodelay(False)` lost the main loop's `timeout(100)` (status messages frozen until a key was pressed).
+- `restore_snapshot` returns `(outcome, reason)`; `plan_purge` raises `PurgeError`; `run_command` returns `None` or the reason.
+- Tests: `tests/parsing_test.py` (13 cases mirroring the Rust ones). CAUTION: `.gitignore` excludes `test_*`, which is why the file is NOT called `test_parsing.py`; run it with `python3 -m unittest discover -s tests -p '*_test.py'`.
+- The CLI (`btrbk_tui.py`) is unchanged apart from the version string: it has no purge nor snapshot creation, and its prefix mapping was already correct.
 
 ## v2.7
 
 ## v2.7 - Chain-aware purge (2026-08-04, commit 31e4d8f)
 
-### Problema
-La purge teneva solo lo snapshot più recente per tipo e cancellava quello che il target di backup usava come **parent** per il prossimo send incrementale. btrbk NON protegge i parent (btrbk.conf(5)) -> il run successivo non trova parent comune e ricade su full send (~900 GiB, oltre un'ora). È così che la catena locale si è rotta il 2026-08-04.
+### Problem
+The purge kept only the newest snapshot per type and deleted the one the backup target used as **parent** for the next incremental send. btrbk does NOT protect parents (btrbk.conf(5)) -> the next run finds no common parent and falls back to a full send (~900 GiB, over an hour). That is how the local chain broke on 2026-08-04.
 
-### Soluzione (btrbk_tui_pro.py + Rust; la CLI non ha purge, non toccata)
-- Si legge il target da `/etc/btrbk/btrbk.conf` (costante `BTRBK_CONF`): primo target ssh.
-- Si interroga il target via ssh: `btrfs subvolume list -u -R` -> insieme dei `received_uuid`.
-- Per ogni snapshot locale si legge l'UUID (`btrfs subvolume show`) e lo si confronta con i received_uuid del target.
-- Sopravvive lo snapshot più recente presente su entrambi + tutto ciò che è più nuovo; si cancella solo ciò che lo precede.
-- **Fail-safe**: target irraggiungibile o nessuno snapshot in comune -> NON si cancella nulla e la UI lo segnala (una catena già rotta non viene peggiorata).
-- La status bar annuncia il controllo del target prima che la chiamata ssh blocchi l'interfaccia.
-- Rust: helper di parsing come funzioni pure (`parse_target_url`, `parse_received_uuids`, `parse_subvolume_uuid`) + wrapper I/O (`btrbk_target_url`, `target_received_uuids`, `local_subvolume_uuid`).
+### Solution (btrbk_tui_pro.py + Rust; the CLI has no purge, untouched)
+- The target is read from `/etc/btrbk/btrbk.conf` (constant `BTRBK_CONF`): first ssh target.
+- The target is queried over ssh: `btrfs subvolume list -u -R` -> set of `received_uuid`s.
+- For each local snapshot the UUID is read (`btrfs subvolume show`) and compared with the target's received_uuids.
+- The newest snapshot present on both survives + everything newer; only what precedes it is deleted.
+- **Fail-safe**: target unreachable or no snapshot in common -> NOTHING is deleted and the UI says so (an already broken chain is not made worse).
+- The status bar announces the target check before the ssh call blocks the interface.
+- Rust: parsing helpers as pure functions (`parse_target_url`, `parse_received_uuids`, `parse_subvolume_uuid`) + I/O wrappers (`btrbk_target_url`, `target_received_uuids`, `local_subvolume_uuid`).
 - Python: `SnapshotManager._get_target_url`, `get_target_received_uuids`, `get_local_uuid`.
-- **Trappola nota**: un match approssimativo su `btrfs subvolume show` restituisce "Parent UUID:" invece di "UUID:" (coperta da test).
+- **Known trap**: a sloppy match on `btrfs subvolume show` returns "Parent UUID:" instead of "UUID:" (covered by a test).
 
-### Test automatici (novità)
-- `btrbk_tui_rust/src/main.rs` ha `mod tests` con 3 unit test: `target_url_is_the_first_ssh_target`, `received_uuids_skip_unset_ones`, `subvolume_uuid_ignores_parent_and_received`. Si eseguono con `cargo test`.
-- Commit 3ebb5c4: i campioni nei test usano host/path/UUID **placeholder** (il repo è pubblico: mai IP LAN, path NAS o UUID reali nei test o nel codice).
+### Automated tests (new)
+- `btrbk_tui_rust/src/main.rs` has `mod tests` with 3 unit tests: `target_url_is_the_first_ssh_target`, `received_uuids_skip_unset_ones`, `subvolume_uuid_ignores_parent_and_received`. Run with `cargo test`.
+- Commit 3ebb5c4: test samples use **placeholder** hosts/paths/UUIDs (the repo is public: never LAN IPs, NAS paths or real UUIDs in tests or code).
 
-### Lint ruff fissato nel repo (commit 653c054)
-- Senza config, il set di regole dipendeva dalla versione di ruff installata: 51 warning accumulati solo per upgrade del tool.
-- `.ruff.toml` fissa la selezione: E, W, F, I, UP, B, C4, SIM, RET, PL, RUF, S, DTZ, EXE (target py39).
-- Deroghe documentate inline: PLW1510 (returncode controllati a mano nel percorso restore/rollback), BLE001 (catch ampi per non lasciare il terminale curses inutilizzabile), S110, DTZ005/DTZ007 (nomi snapshot btrbk in ora locale), PLW0603.
-- 166 finding corretti senza cambi di comportamento: generics builtin al posto di `typing`, `sys.exit()`, `.values()`, `contextlib.suppress`, variabili spacchettate inutilizzate.
+### Ruff lint pinned in the repo (commit 653c054)
+- Without a config, the rule set depended on the installed ruff version: 51 warnings accumulated just from tool upgrades.
+- `.ruff.toml` pins the selection: E, W, F, I, UP, B, C4, SIM, RET, PL, RUF, S, DTZ, EXE (target py39).
+- Exceptions documented inline: PLW1510 (return codes checked by hand in the restore/rollback path), BLE001 (broad catches so the curses terminal is not left unusable), S110, DTZ005/DTZ007 (btrbk snapshot names in local time), PLW0603.
+- 166 findings fixed with no behaviour change: builtin generics instead of `typing`, `sys.exit()`, `.values()`, `contextlib.suppress`, unused unpacked variables.
 
 ### Desktop entry (commit d952dc5)
-- `btrbk-tui.desktop` era un symlink rotto verso la home dell'autore; ora è un file reale: `Exec=pkexec /usr/local/bin/btrbk_tui`, `Terminal=true`. Passa `desktop-file-validate`. Installazione documentata nel README (`install -Dm644 ... ~/.local/share/applications/`).
+- `btrbk-tui.desktop` was a broken symlink into the author's home; now it is a real file: `Exec=pkexec /usr/local/bin/btrbk_tui`, `Terminal=true`. Passes `desktop-file-validate`. Installation documented in the README (`install -Dm644 ... ~/.local/share/applications/`).
 
-## Versioni Precedenti
-- v2.6 (2026-06-24): audit hardening - rollback verificato con 3 esiti (success/failed/rollback_failed), pre-check sorgente, guardia `btrfs subvolume show`, CLI in parità (verify+rollback, config condivisa, root check, sync), `truncate_str` UTF-8 safe, `render_output_area`, cache snapshot (invalidata su R/restore/purge/clean/create/edit path), zero warning clippy, hook ruff
-- v2.6 (2026-04-12): fix catch-all verify, messaggi status, parser ANSI, parità verify Python/Rust
-- v2.5: Interfaccia adattiva, colonne dinamiche, rinomina file
-- v2.2: Fix timestamp, .BROKEN conflicts, comando B, logica dinamica
+## Earlier Versions
+- v2.6 (2026-06-24): hardening audit - verified rollback with 3 outcomes (success/failed/rollback_failed), source pre-check, `btrfs subvolume show` guard, CLI at parity (verify+rollback, shared config, root check, sync), UTF-8 safe `truncate_str`, `render_output_area`, snapshot cache (invalidated on R/restore/purge/clean/create/edit path), zero clippy warnings, ruff hook
+- v2.6 (2026-04-12): catch-all verify fix, status messages, ANSI parser, verify parity Python/Rust
+- v2.5: Adaptive interface, dynamic columns, file rename
+- v2.2: Timestamp fix, .BROKEN conflicts, B command, dynamic logic

@@ -32,17 +32,17 @@ const KEY_SPACE: i32 = 32;
 const KEY_DEL: i32 = 127;
 const KEY_BS: i32 = 8;
 
-// Durata dei messaggi di stato
+// How long status messages stay on screen
 const STATUS_SHORT: Duration = Duration::from_secs(3);
 const STATUS_MEDIUM: Duration = Duration::from_secs(5);
 const STATUS_LONG: Duration = Duration::from_secs(10);
 const STATUS_RESULT: Duration = Duration::from_secs(15);
 const STATUS_CRITICAL: Duration = Duration::from_secs(60);
 
-/// Righe di output di btrbk tenute in memoria durante la creazione degli snapshot.
+/// Lines of btrbk output kept in memory while creating snapshots.
 const MAX_OUTPUT_LINES: usize = 1000;
 
-/// Voci della schermata Settings, nell'ordine in cui sono mostrate.
+/// Settings screen entries, in display order.
 const SETTINGS: [&str; 5] = [
     "BTR Pool Directory",
     "Snapshots Directory",
@@ -75,21 +75,21 @@ impl Default for Config {
     }
 }
 
-/// Snapshot raggruppati per subvolume ("@" per primo, poi in ordine alfabetico);
-/// dentro ogni gruppo il più recente è in testa.
+/// Snapshots grouped by subvolume ("@" first, then alphabetically); inside
+/// each group the newest one comes first.
 type SnapshotGroups = Vec<(String, Vec<String>)>;
 
 /// Snapshots of one subvolume, oldest first, each with its UUID (None when it
 /// could not be read).
 type PurgeCandidates = (String, Vec<(String, Option<String>)>);
 
-/// Esito di un'operazione di restore. Le varianti di errore portano il motivo.
+/// Outcome of a restore. The error variants carry the reason.
 enum RestoreOutcome {
-    /// Restore completato e verificato.
+    /// Restore completed and verified.
     Success,
-    /// Restore fallito ma rollback riuscito: il sistema è nello stato precedente.
+    /// Restore failed but rollback succeeded: the system is in its previous state.
     Failed(String),
-    /// Restore fallito E rollback fallito: stato incoerente, intervento manuale necessario.
+    /// Restore failed AND rollback failed: inconsistent state, manual action needed.
     RollbackFailed(String),
 }
 
@@ -132,8 +132,8 @@ struct App {
     status_message: String,
     status_until: Option<Instant>,
     reboot_needed: bool,
-    // Cache degli snapshot: evita di rileggere il filesystem ad ogni frame.
-    // None = cache invalidata (verrà ricalcolata al prossimo accesso).
+    // Snapshot cache: avoids rereading the filesystem on every frame.
+    // None = cache invalidated (recomputed on the next access).
     snapshots_cache: Option<Rc<SnapshotGroups>>,
 }
 
@@ -180,7 +180,7 @@ impl App {
         app
     }
 
-    /// Restituisce gli snapshot dalla cache, ricalcolandoli solo se invalidata.
+    /// Returns the cached snapshots, recomputing them only if invalidated.
     fn snapshots_cached(&mut self) -> Rc<SnapshotGroups> {
         if let Some(cached) = &self.snapshots_cache {
             return Rc::clone(cached);
@@ -190,7 +190,7 @@ impl App {
         fresh
     }
 
-    /// Invalida la cache: il prossimo accesso rileggerà il filesystem.
+    /// Invalidates the cache: the next access rereads the filesystem.
     fn invalidate_snapshots(&mut self) {
         self.snapshots_cache = None;
     }
@@ -274,9 +274,9 @@ impl App {
         self.status_until = Some(Instant::now() + duration);
     }
 
-    /// Mostra subito un messaggio prima di un'operazione che blocca l'interfaccia.
-    /// `set_status` da solo non basta: il messaggio verrebbe disegnato solo al
-    /// frame successivo, cioè a operazione già conclusa.
+    /// Shows a message right away, before an operation that blocks the interface.
+    /// `set_status` alone is not enough: the message would only be drawn on the
+    /// next frame, that is once the operation is over.
     fn show_busy(&mut self, message: &str) {
         self.set_status(message, STATUS_SHORT);
         self.draw_screen();
@@ -335,7 +335,7 @@ impl App {
             return Err("failed to capture btrbk output".to_string());
         };
 
-        // I thread terminano da soli quando le pipe si chiudono
+        // The threads end on their own when the pipes close
         let (tx, rx) = mpsc::channel();
         let tx_stderr = tx.clone();
         thread::spawn(move || forward_stream(stdout, &tx));
@@ -386,9 +386,9 @@ impl App {
                 render_output_area(&log.lines, output_start_y, output_height);
                 refresh();
             }
-            // Si esce solo a btrbk terminato, così l'escalation a SIGKILL qui
-            // sopra resta attiva finché serve. Se qualcuno tiene ancora aperte
-            // le pipe dopo la sua uscita non lo si aspetta all'infinito.
+            // Leave only once btrbk is gone, so the SIGKILL escalation above
+            // stays armed. If something still holds the pipes open after it
+            // exited, do not wait for it forever.
             if exited_at.is_none() && matches!(process.try_wait(), Ok(Some(_))) {
                 exited_at = Some(Instant::now());
             }
@@ -578,8 +578,8 @@ impl App {
         }
     }
 
-    /// Riporta la selezione dentro i limiti: le liste cambiano dopo refresh,
-    /// purge e restore, e una selezione fuori lista sarebbe invisibile.
+    /// Brings the selection back within bounds: lists change after refresh,
+    /// purge and restore, and a selection past the end would be invisible.
     fn clamp_selection(&mut self, groups: &SnapshotGroups) {
         self.selected_col = self.selected_col.min(groups.len().saturating_sub(1));
         let rows = groups.get(self.selected_col).map_or(0, |(_, s)| s.len());
@@ -627,7 +627,7 @@ impl App {
             put(start_y - 1, col_x, &truncate_str(&header, text_width));
             attroff(COLOR_PAIR(2) | A_BOLD());
 
-            // Solo la colonna selezionata scorre, quanto basta a tenere visibile il cursore
+            // Only the selected column scrolls, just enough to keep the cursor visible
             let first = if col_idx == self.selected_col {
                 (self.selected_row + 1).saturating_sub(visible)
             } else {
@@ -709,8 +709,8 @@ impl App {
     }
 
     fn draw_screen(&mut self) {
-        // erase() e non clear(): clear() forza il ridisegno completo del
-        // terminale ad ogni refresh, cioè sfarfallio a ogni frame
+        // erase() and not clear(): clear() forces a full terminal repaint on
+        // every refresh, which means flicker on every frame
         erase();
         self.draw_header();
         match self.screen {
@@ -775,7 +775,7 @@ impl App {
     fn restore_snapshot(&self, snapshot: &str, subvol_name: &str) -> RestoreOutcome {
         let source_path = Path::new(&self.config.snapshots_dir).join(snapshot);
 
-        // Pre-check: lo snapshot sorgente deve esistere prima di toccare il subvolume corrente
+        // Pre-check: the source snapshot must exist before touching the current subvolume
         if !source_path.exists() {
             return RestoreOutcome::Failed(format!("{} no longer exists", source_path.display()));
         }
@@ -789,8 +789,8 @@ impl App {
         let current_existed = current_subvol.exists();
 
         if current_existed {
-            // Guardia: deve essere un vero subvolume btrfs prima di spostarlo
-            // (evita di spostare/distruggere una directory normale per errore)
+            // Guard: it must be a real btrfs subvolume before moving it
+            // (avoids moving/destroying a plain directory by mistake)
             if let Err(reason) =
                 run_command(&["btrfs", "subvolume", "show", &current_subvol.to_string_lossy()])
             {
@@ -806,14 +806,14 @@ impl App {
                 return RestoreOutcome::Failed(format!("{} already exists", broken_subvol.display()));
             }
 
-            // Move current to .BROKEN. rename(2) e non mv: tra filesystem
-            // diversi fallisce, invece di mettersi a copiare un subvolume
+            // Move current to .BROKEN. rename(2) rather than mv: across
+            // filesystems it fails instead of starting to copy a subvolume
             if let Err(err) = fs::rename(&current_subvol, &broken_subvol) {
                 return RestoreOutcome::Failed(format!("cannot move {}: {}", subvol_name, err));
             }
         }
 
-        // Rollback: rimette al suo posto il subvolume originale
+        // Rollback: puts the original subvolume back in place
         let roll_back = |reason: String| -> RestoreOutcome {
             if current_existed && let Err(err) = fs::rename(&broken_subvol, &current_subvol) {
                 return RestoreOutcome::RollbackFailed(format!(
@@ -837,13 +837,13 @@ impl App {
             return roll_back(format!("snapshot failed: {}", reason));
         }
 
-        // Verifica che il restore sia andato a buon fine
+        // Check that the restore worked
         if let Err(reason) = self.verify_restore_success(&current_subvol, subvol_name) {
-            // Rollback completo: rimuovi il subvolume fallito e ripristina l'originale
+            // Full rollback: remove the failed subvolume and restore the original
             if let Err(err) =
                 run_command(&["btrfs", "subvolume", "delete", &current_subvol.to_string_lossy()])
             {
-                // Il subvolume fallito occupa ancora il path: impossibile ripristinare l'originale
+                // The failed subvolume still holds the path: the original cannot go back
                 return RestoreOutcome::RollbackFailed(format!(
                     "{}; cannot remove the failed restore ({}), original kept as {}",
                     reason,
@@ -854,7 +854,7 @@ impl App {
             return roll_back(reason);
         }
 
-        // Auto cleanup if enabled - rimuovi .BROKEN solo se il restore è andato a buon fine
+        // Auto cleanup if enabled - remove .BROKEN only after a successful restore
         if self.config.auto_cleanup && current_existed {
             let _ = run_command(&["btrfs", "subvolume", "delete", &broken_subvol.to_string_lossy()]);
         }
@@ -863,18 +863,18 @@ impl App {
     }
 
     fn verify_restore_success(&self, restored_subvol: &Path, subvol_name: &str) -> Result<(), String> {
-        // 1. Verifica che il subvolume esista
+        // 1. The subvolume must exist
         if !restored_subvol.exists() {
             return Err("restored subvolume is missing".to_string());
         }
 
-        // 2. Verifica che sia un subvolume btrfs valido
+        // 2. It must be a valid btrfs subvolume
         run_command(&["btrfs", "subvolume", "show", &restored_subvol.to_string_lossy()])
             .map_err(|reason| format!("restored path is not a subvolume: {}", reason))?;
 
-        // 3. Verifica file/directory critici in base al subvolume. Root e home
-        // si riconoscono dal nome "@"/"@home" o da ciò che è montato su / e
-        // /home: nei layout senza "@" si chiamano root, rootfs, home...
+        // 3. Critical files/directories, depending on the subvolume. Root and
+        // home are recognised by the name "@"/"@home" or by what is mounted on
+        // / and /home: layouts without "@" call them root, rootfs, home...
         let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
         let mounted_at = |mountpoint: &str| mounted_subvolume(&mountinfo, mountpoint);
         let kind = if subvol_name == "@" || mounted_at("/").as_deref() == Some(subvol_name) {
@@ -905,8 +905,8 @@ impl App {
                 }
             }
             _ => {
-                // Per qualsiasi altro subvolume (@games, @work, @custom, ecc.):
-                // verifica solo che sia leggibile
+                // Any other subvolume (@games, @work, @custom, etc.):
+                // just check that it is readable
                 fs::read_dir(restored_subvol)
                     .map_err(|err| format!("restored subvolume is unreadable: {}", err))?;
             }
@@ -1051,7 +1051,7 @@ impl App {
         }
 
         let result = self.create_snapshot();
-        // anche un run interrotto può aver già creato degli snapshot
+        // even an interrupted run may have created snapshots already
         self.invalidate_snapshots();
         let hooks = self.run_post_change_hooks();
         match result {
@@ -1092,10 +1092,10 @@ impl App {
             return;
         };
 
-        // Il subvolume da sostituire è il prefisso dello snapshot, così com'è:
-        // "@" -> @, "@home" -> @home, "@root" -> @root (mai confuso con "@").
-        // Il dialogo dice quale path verrà toccato: con un pool sbagliato nei
-        // settings sarebbe creato un subvolume nuovo invece di sostituirlo
+        // The subvolume to replace is the snapshot prefix, untouched:
+        // "@" -> @, "@home" -> @home, "@root" -> @root (never mistaken for "@").
+        // The dialog names the path that will be touched: with a wrong pool in
+        // the settings a new subvolume would be created instead of replaced
         let target = Path::new(&self.config.btr_pool_dir).join(subvol_name);
         let effect = if target.exists() {
             format!("Replaces {} (the old one is kept as .BROKEN)", target.display())
@@ -1191,7 +1191,7 @@ impl App {
 
         let mut input = String::new();
         let confirmed = loop {
-            // Se il testo non ci sta si mostra la coda, dove si sta scrivendo
+            // When the text does not fit, show its tail: where the typing happens
             let tail: String = {
                 let count = input.chars().count();
                 input.chars().skip(count.saturating_sub(input_width)).collect()
@@ -1466,8 +1466,8 @@ fn config_candidates(invoking_home: Option<&Path>, home: Option<&Path>) -> Vec<P
     {
         homes.push(home);
     }
-    // Mai ripiegare su una directory scrivibile da tutti: questo tool gira
-    // come root e la config decide su quali path agiscono rename e btrfs delete
+    // Never fall back on a world-writable directory: this tool runs as root
+    // and the config decides which paths rename and btrfs delete act on
     if homes.is_empty() {
         homes.push(Path::new("/root"));
     }
@@ -1724,15 +1724,14 @@ fn key_char(key: i32) -> Option<char> {
         .map(|byte| byte.to_ascii_lowercase() as char)
 }
 
-/// Tronca una stringa a `max_chars` caratteri rispettando i confini UTF-8.
-/// Evita i panic dello slicing per byte (`&s[..n]`) su caratteri multibyte.
+/// Truncates a string to `max_chars` characters, respecting UTF-8 boundaries.
+/// Avoids the panics of byte slicing (`&s[..n]`) on multibyte characters.
 fn truncate_str(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
-/// Scrive `text` a (y, x) tagliandolo al bordo destro. Coordinate fuori dallo
-/// schermo vengono ignorate: nessun disegno può andare in panic o a capo,
-/// qualunque sia la dimensione del terminale.
+/// Writes `text` at (y, x), clipped at the right edge. Off-screen coordinates
+/// are ignored: no drawing can panic or wrap, whatever the terminal size.
 fn put(y: i32, x: i32, text: &str) {
     let (height, width) = get_max_yx();
     if y < 0 || x < 0 || y >= height || x >= width {
@@ -1751,8 +1750,8 @@ fn put_separator(y: i32) {
     put(y, 0, &"-".repeat(width.max(0) as usize));
 }
 
-/// Ridisegna l'area di output mostrando le ultime `height` righe disponibili.
-/// Pulisce l'intera area prima di ridisegnare, evitando residui durante lo scroll.
+/// Redraws the output area with the last `height` lines available.
+/// Clears the whole area first, so no leftovers remain while scrolling.
 fn render_output_area(lines: &[String], start_y: i32, height: i32) {
     let (_, width) = get_max_yx();
     let blank = " ".repeat(width.max(0) as usize);
@@ -1841,8 +1840,8 @@ fn main() {
         std::process::exit(print_purge_plan(config_file));
     }
 
-    // Un panic dentro curses lascerebbe il terminale inutilizzabile e il
-    // messaggio illeggibile: prima si esce da curses, poi si stampa
+    // A panic inside curses would leave the terminal unusable and the message
+    // unreadable: leave curses first, then print
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         endwin();
@@ -1855,7 +1854,7 @@ fn main() {
     cbreak();
     noecho();
     keypad(stdscr(), true);
-    // Senza questo ESC viene riconosciuto solo dopo un secondo
+    // Without this ESC is only recognised after a full second
     set_escdelay(25);
 
     // Create and run the TUI app
@@ -2090,7 +2089,7 @@ ID 257 gen 1 top level 5 parent_uuid - received_uuid - uuid 0ed5ab3d-732e-4544-8
     fn output_lines_lose_ansi_and_control_characters() {
         assert_eq!(clean_output_line("\x1b[1;32mdone\x1b[0m"), "done");
         assert_eq!(clean_output_line("a\tb\x07c"), "a bc");
-        assert_eq!(clean_output_line("già fatto"), "già fatto");
+        assert_eq!(clean_output_line("naïve café"), "naïve café");
     }
 
     #[test]

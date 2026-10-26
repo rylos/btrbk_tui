@@ -1,34 +1,34 @@
 # Task Completion Guidelines - BTRBK TUI
 
-## Dopo Modifiche al Codice
+## After Code Changes
 
-### Verifica Python
+### Python checks
 ```bash
 python3 -m py_compile btrbk_tui.py btrbk_tui_pro.py
-ruff check .                                 # regole fissate in .ruff.toml, deve essere pulito
-python3 -m unittest discover -s tests -p '*_test.py'   # 15 test, speculari a quelli Rust
+ruff check .                                 # rules pinned in .ruff.toml, must be clean
+python3 -m unittest discover -s tests -p '*_test.py'   # 15 tests, mirroring the Rust ones
 sudo ./btrbk_tui.py
 sudo ./btrbk_tui_pro.py
 ```
 
-### Verifica Rust
+### Rust checks
 ```bash
 cd btrbk_tui_rust && cargo check
-cargo clippy --release        # zero warning
-cargo test                    # unit test delle funzioni di parsing (purge chain-aware)
+cargo clippy --release        # zero warnings
+cargo test                    # unit tests of the parsing functions (chain-aware purge)
 cargo build --release
 sudo ./target/release/btrbk_tui
 ```
 
-## Regole Generali
-- Mantenere parità funzionale tra Python TUI Pro e Rust (la CLI non ha purge)
-- Garantire compatibilità schema JSON config condiviso
-- Aggiornare README.md per nuove funzionalità
-- Verificare permessi eseguibili: `chmod +x *.py`
-- Test automatici sulle funzioni pure, con gli STESSI casi in Rust (`mod tests`) e Python (`tests/parsing_test.py`): una modifica alla logica va fatta e testata in entrambe. Logica nuova -> funzione pura + unit test nelle due versioni
-- Prove end-to-end senza toccare il pool vero: btrfs in loopback + `--config <file>` per la config, finto `btrbk` in testa al PATH, TUI pilotata con `tmux send-keys`/`capture-pane`, `--purge-plan` per la purge (vedi `mem:latest_changes`)
-- **Repo pubblico**: nei test e nel codice usare solo host/path/UUID placeholder, mai IP LAN, path NAS o UUID reali
-- Nuove deroghe ruff: documentarle inline in `.ruff.toml`, non lasciarle implicite
-- Tutte le operazioni richiedono root (sudo)
-- Verificare che backup `.BROKEN` funzioni correttamente
-- La purge non deve mai cancellare il parent snapshot del target (vedi `mem:latest_changes`)
+## General Rules
+- Keep feature parity between Python TUI Pro and Rust (the CLI has no purge)
+- Keep the shared JSON config schema compatible
+- Update README.md for new features
+- Check executable permissions: `chmod +x *.py`
+- Automated tests on the pure functions, with the SAME cases in Rust (`mod tests`) and Python (`tests/parsing_test.py`): a logic change must be made and tested in both. New logic -> pure function + unit test in both versions
+- End-to-end tests without touching the real pool: btrfs on loopback + `--config <file>` for the config, fake `btrbk` at the front of PATH, TUI driven with `tmux send-keys`/`capture-pane`, `--purge-plan` for the purge (see `mem:latest_changes`)
+- **Public repo**: use only placeholder hosts/paths/UUIDs in tests and code, never LAN IPs, NAS paths or real UUIDs
+- New ruff exceptions: document them inline in `.ruff.toml`, never leave them implicit
+- All operations need root (sudo)
+- Check that the `.BROKEN` backup works correctly
+- The purge must never delete the target's parent snapshot (see `mem:latest_changes`)

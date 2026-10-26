@@ -186,7 +186,7 @@ class OutputTest(unittest.TestCase):
     def test_lines_lose_ansi_and_control_characters(self):
         self.assertEqual(tui.clean_output_line("\x1b[1;32mdone\x1b[0m"), "done")
         self.assertEqual(tui.clean_output_line("a\tb\x07c"), "a bc")
-        self.assertEqual(tui.clean_output_line("già fatto"), "già fatto")
+        self.assertEqual(tui.clean_output_line("naïve café"), "naïve café")
 
     def test_progress_updates_replace_each_other(self):
         log = tui.OutputLog()

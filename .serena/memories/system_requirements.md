@@ -1,14 +1,14 @@
 # System Requirements - BTRBK TUI v2.7
 
-## Requisiti Sistema
-- Linux con filesystem Btrfs
-- Root access (sudo) per operazioni btrfs
+## System Requirements
+- Linux with a Btrfs filesystem
+- Root access (sudo) for btrfs operations
 - `btrfs-progs`, `btrbk`
-- Purge chain-aware: `/etc/btrbk/btrbk.conf` leggibile con un target ssh, e accesso ssh di root al target (senza: la purge non cancella nulla, fail-safe)
-- Desktop entry: `pkexec` + agente polkit
+- Chain-aware purge: a readable `/etc/btrbk/btrbk.conf` with an ssh target, and root ssh access to the target (without it the purge deletes nothing, fail-safe)
+- Desktop entry: `pkexec` + a polkit agent
 
 ## Python
-- Python 3.10+ (annotazioni `str | None` valutate a runtime; stdlib: `contextlib`, `curses`, `json`, `os`, `subprocess`, `sys`, `datetime`, `pathlib`)
+- Python 3.10+ (`str | None` annotations evaluated at runtime; stdlib: `contextlib`, `curses`, `json`, `os`, `subprocess`, `sys`, `datetime`, `pathlib`)
 - Dev: `ruff` (config in `.ruff.toml`)
 
 ## Rust (Cargo.toml)
@@ -23,7 +23,7 @@ libc = "0.2"
 ```
 - Rust edition 2024, rustc 1.87.0+
 
-## Percorsi Runtime
+## Runtime Paths
 - Config: `~/.config/btrbk_tui/config.json`
-- Pool default: `/mnt/btr_pool`
-- Snapshots default: `/mnt/btr_pool/btrbk_snapshots`
+- Default pool: `/mnt/btr_pool`
+- Default snapshots: `/mnt/btr_pool/btrbk_snapshots`

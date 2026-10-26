@@ -15,15 +15,15 @@ from btrbk_tui_pro import (
     split_snapshot_name,
 )
 
-# Configura le cartelle (default; sovrascritte dalla config condivisa se presente)
+# Directories (defaults; overridden by the shared config if present)
 btr_pool_dir = "/mnt/btr_pool"
 snapshots_dir = "/mnt/btr_pool/btrbk_snapshots"
 
 def load_config():
-    """Carica btr_pool_dir e snapshots_dir dalla config condivisa con le TUI.
+    """Load btr_pool_dir and snapshots_dir from the config shared with the TUIs.
 
-    Stessa ricerca delle TUI: sotto sudo la config dell'utente che ha lanciato
-    sudo, poi quella di root, poi il vecchio percorso ~/.config/btrbk_restore.
+    Same lookup as the TUIs: under sudo the config of the user who ran sudo,
+    then root's, then the old ~/.config/btrbk_restore path.
     """
     global btr_pool_dir, snapshots_dir
     config = Config()
@@ -55,8 +55,8 @@ def display_snapshots(snapshot_groups):
         print("No snapshots found!")
         sys.exit(1)
 
-    print("Lista degli snapshot disponibili:\n")
-    print("0. Esci")
+    print("Available snapshots:\n")
+    print("0. Exit")
 
     snapshot_list = []
     counter = 1
@@ -73,17 +73,17 @@ def display_snapshots(snapshot_groups):
     return snapshot_list
 
 def verify_restore_success(target_path, prefix):
-    """Verifica l'integrità del subvolume ripristinato (coerente con le TUI)."""
+    """Check the integrity of the restored subvolume (consistent with the TUIs)."""
     if not os.path.exists(target_path):
         return False
 
-    # Deve essere un subvolume btrfs valido
+    # Must be a valid btrfs subvolume
     if subprocess.run(["btrfs", "subvolume", "show", target_path],
                       capture_output=True).returncode != 0:
         return False
 
-    # Root e home si riconoscono dal nome "@"/"@home" o da ciò che è montato
-    # su / e /home: nei layout senza "@" si chiamano root, rootfs, home...
+    # Root and home are recognised by the name "@"/"@home" or by what is mounted
+    # on / and /home: layouts without "@" call them root, rootfs, home...
     try:
         with open("/proc/self/mountinfo") as f:
             mountinfo = f.read()
@@ -106,7 +106,7 @@ def verify_restore_success(target_path, prefix):
         except OSError:
             return False
     else:
-        # Qualsiasi altro tipo (@games, @work, ecc.): basta che sia leggibile
+        # Any other type (@games, @work, etc.): readable is enough
         try:
             os.listdir(target_path)
         except OSError:
@@ -126,84 +126,84 @@ def restore_snapshot(selected_snapshot, prefix):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     broken_path = f"{target_path}.BROKEN.{timestamp}"
 
-    print(f"\nRipristino snapshot: {selected_snapshot}")
-    print(f"Tipo: {prefix}")
-    print(f"Da: {source_path}")
-    print(f"A: {target_path}")
+    print(f"\nRestoring snapshot: {selected_snapshot}")
+    print(f"Type: {prefix}")
+    print(f"From: {source_path}")
+    print(f"To: {target_path}")
 
-    # Pre-check: lo snapshot sorgente deve esistere
+    # Pre-check: the source snapshot must exist
     if not os.path.exists(source_path):
-        print(f"❌ Errore: snapshot sorgente non trovato: {source_path}")
+        print(f"❌ Error: source snapshot not found: {source_path}")
         sys.exit(1)
 
     current_existed = os.path.exists(target_path)
 
-    # Guardia: il subvolume corrente deve essere un vero subvolume btrfs
+    # Guard: the current subvolume must be a real btrfs subvolume
     if current_existed:
         if subprocess.run(["btrfs", "subvolume", "show", target_path],
                           capture_output=True).returncode != 0:
-            print(f"❌ Errore: {target_path} non è un subvolume btrfs valido. Operazione annullata.")
+            print(f"❌ Error: {target_path} is not a valid btrfs subvolume. Operation cancelled.")
             sys.exit(1)
 
-        print(f"Spostamento {target_path} -> {broken_path}")
+        print(f"Moving {target_path} -> {broken_path}")
         if subprocess.run(["mv", "--verbose", target_path, broken_path]).returncode != 0:
-            print("❌ Errore: impossibile spostare il subvolume corrente. Operazione annullata.")
+            print("❌ Error: cannot move the current subvolume. Operation cancelled.")
             sys.exit(1)
 
     # Create snapshot
-    print("Creazione snapshot...")
+    print("Creating snapshot...")
     if subprocess.run(["btrfs", "subvolume", "snapshot", source_path, target_path]).returncode != 0:
-        print("❌ Errore: creazione snapshot fallita. Rollback in corso...")
+        print("❌ Error: snapshot creation failed. Rolling back...")
         if current_existed:
             if subprocess.run(["mv", broken_path, target_path]).returncode != 0:
-                print(f"🔥 CRITICO: rollback fallito! Stato incoerente. Recupero manuale: {broken_path}")
+                print(f"🔥 CRITICAL: rollback failed! Inconsistent state. Manual recovery: {broken_path}")
                 sys.exit(1)
-            print("↩️  Rollback completato: stato precedente ripristinato.")
+            print("↩️  Rollback complete: previous state restored.")
         sys.exit(1)
 
     # Verify restore success
     if not verify_restore_success(target_path, prefix):
-        print("❌ Errore: verifica integrità fallita. Rollback in corso...")
+        print("❌ Error: integrity check failed. Rolling back...")
         if subprocess.run(["btrfs", "subvolume", "delete", target_path]).returncode != 0:
-            print(f"🔥 CRITICO: impossibile rimuovere il subvolume fallito! Recupero manuale: {broken_path}")
+            print(f"🔥 CRITICAL: cannot remove the failed subvolume! Manual recovery: {broken_path}")
             sys.exit(1)
         if current_existed:
             if subprocess.run(["mv", broken_path, target_path]).returncode != 0:
-                print(f"🔥 CRITICO: rollback fallito! Stato incoerente. Recupero manuale: {broken_path}")
+                print(f"🔥 CRITICAL: rollback failed! Inconsistent state. Manual recovery: {broken_path}")
                 sys.exit(1)
-            print("↩️  Rollback completato: stato precedente ripristinato.")
+            print("↩️  Rollback complete: previous state restored.")
         sys.exit(1)
 
-    print("✅ Snapshot ripristinato con successo!")
+    print("✅ Snapshot restored successfully!")
 
     # Ask about removing .BROKEN
     if current_existed and os.path.exists(broken_path):
-        do_remove_broken = input(f"\nVuoi eliminare lo snapshot {subvolume_name}.BROKEN? (s/n): ")
-        if do_remove_broken.lower() == 's':
-            print(f"Eliminazione {broken_path}...")
+        do_remove_broken = input(f"\nDelete the {subvolume_name}.BROKEN snapshot? (y/n): ")
+        if do_remove_broken.lower() == 'y':
+            print(f"Deleting {broken_path}...")
             if subprocess.run(["btrfs", "subvolume", "delete", broken_path]).returncode == 0:
-                print("✅ Snapshot .BROKEN eliminato!")
+                print("✅ .BROKEN snapshot deleted!")
             else:
-                print("⚠️  Impossibile eliminare lo snapshot .BROKEN.")
+                print("⚠️  Could not delete the .BROKEN snapshot.")
 
     # Ask about reboot
-    do_reboot = input("\nVuoi riavviare il sistema? (s/n): ")
-    if do_reboot.lower() == 's':
-        print("Riavvio del sistema...")
+    do_reboot = input("\nReboot the system? (y/n): ")
+    if do_reboot.lower() == 'y':
+        print("Rebooting the system...")
         subprocess.run(["sync"])
         subprocess.run(["reboot"])
 
 def main():
     """Main function."""
-    # Le operazioni btrfs richiedono privilegi di root
+    # btrfs operations need root privileges
     if os.geteuid() != 0:
-        print("❌ Errore: questo strumento richiede privilegi di root. Esegui con sudo.")
+        print("❌ Error: this tool needs root privileges. Run it with sudo.")
         sys.exit(1)
 
-    print(f"🔄 BTRBK TUI v{VERSION} - Versione CLI Dinamica")
+    print(f"🔄 BTRBK TUI v{VERSION} - Dynamic CLI Version")
     print("=" * 50)
 
-    # Carica la configurazione condivisa con le versioni TUI
+    # Load the config shared with the TUI versions
     load_config()
 
     # Get snapshot groups dynamically
@@ -214,14 +214,14 @@ def main():
 
     # Get user choice
     try:
-        choice = int(input(f"\nScegli lo snapshot da ripristinare (0-{len(snapshot_list)}): "))
+        choice = int(input(f"\nChoose the snapshot to restore (0-{len(snapshot_list)}): "))
     except ValueError:
-        print("❌ Scelta non valida. Inserire un numero.")
+        print("❌ Invalid choice. Enter a number.")
         sys.exit(1)
 
     # Exit if 0
     if choice == 0:
-        print("👋 Uscita...")
+        print("👋 Exiting...")
         sys.exit(0)
 
     # Validate choice
@@ -229,7 +229,7 @@ def main():
         selected_snapshot, prefix = snapshot_list[choice - 1]
         restore_snapshot(selected_snapshot, prefix)
     else:
-        print("❌ Scelta non valida.")
+        print("❌ Invalid choice.")
         sys.exit(1)
 
 if __name__ == "__main__":
