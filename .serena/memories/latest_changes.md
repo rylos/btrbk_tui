@@ -1,4 +1,11 @@
-# Latest Changes - BTRBK TUI v2.9
+# Latest Changes - BTRBK TUI v2.10
+
+## v2.10 - Hook dopo le modifiche agli snapshot (2026-10-26)
+
+- Dopo una purge che ha cancellato qualcosa e dopo ogni `btrbk run` lanciato con `I` (riuscito o no), Rust e Python eseguono i programmi in `/etc/btrbk_tui/post-change.d/` in ordine di nome, come run-parts. Un hook fallito è nominato nella barra di stato.
+- Solo hook di root: file regolare eseguibile di proprietà di root, non scrivibile da gruppo/altri (un symlink conta per il suo bersaglio), in una cartella con le stesse regole. Volutamente NON un'opzione della config utente: la TUI gira come root e un comando letto dalla home dell'utente sarebbe un'escalation.
+- Funzioni pure testate: `hook_allowed(uid, mode, is_file)`, `hook_name_allowed(name)`; I/O: `post_change_hooks(dir)`, `App::run_post_change_hooks` / `TUIApp.run_post_change_hooks`. 16 test per versione.
+- Uso su pc-casa: `/etc/btrbk_tui/post-change.d/50-btrbk-nas` -> `/usr/local/bin/btrbk-nas-push-uuids` (progetto btrbk-nas, `~/dev/btrbk-nas` su pc-work): aggiorna sul NAS l'elenco degli snapshot del PC, da cui l'app DSM calcola il prossimo parent. `I` non passa da btrbk.service, quindi senza hook l'elenco resterebbe indietro.
 
 ## v2.9 - Qualsiasi layout btrbk (2026-09-24, dalle issue GitHub #1-#4)
 

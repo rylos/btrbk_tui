@@ -1,4 +1,4 @@
-# Struttura Codebase - BTRBK TUI v2.9
+# Struttura Codebase - BTRBK TUI v2.10
 
 ## Layout Directory
 ```
@@ -6,9 +6,9 @@ btrbk_tui/
 ├── README.md
 ├── btrbk_tui.py                  # CLI semplice (~260 righe, verify+rollback+config condivisa, NO purge)
 ├── btrbk_tui_pro.py              # Python TUI professionale (~1040 righe, port 1:1 di Rust)
-├── tests/parsing_test.py         # 13 unittest delle funzioni pure Python
+├── tests/parsing_test.py         # 16 unittest delle funzioni pure Python
 ├── btrbk_tui_rust/               # Rust TUI
-│   ├── Cargo.toml               # edition 2024, v2.8.0
+│   ├── Cargo.toml               # edition 2024, v2.10.0
 │   ├── src/main.rs              # ~1850 righe, include mod tests
 │   └── target/release/btrbk_tui
 ├── btrbk-tui.desktop            # desktop entry reale (pkexec /usr/local/bin/btrbk_tui)
@@ -37,7 +37,7 @@ btrbk_tui/
 - `print_purge_plan`, `main` (opzioni `--purge-plan`, `--version`, `--help`)
 
 ## `tests/parsing_test.py`
-13 unittest speculari ai test Rust. Non si chiama `test_*.py` perché `.gitignore` esclude quel pattern.
+16 unittest speculari ai test Rust. Non si chiama `test_*.py` perché `.gitignore` esclude quel pattern.
 
 ## `btrbk_tui_rust/src/main.rs` (Rust TUI, v2.8, ~1850 righe)
 - Costanti: `BTRBK_CONF`, `VERSION` (da Cargo), `KEY_*`, `STATUS_*` (Duration), `SETTINGS`

@@ -20,10 +20,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.9.0"
+VERSION = "2.10.0"
 
 # btrbk configuration, read to discover the backup target
 BTRBK_CONF = "/etc/btrbk/btrbk.conf"
+# Programs run after the snapshots change (purge, btrbk run), in name order
+# like run-parts. Root-owned on purpose: the tool runs as root, and a hook read
+# from the user's configuration would let that user run anything as root.
+# btrbk-nas uses one to tell the NAS which snapshots this PC holds.
+POST_CHANGE_DIR = Path("/etc/btrbk_tui/post-change.d")
 
 # Default configuration
 DEFAULT_CONFIG = {
@@ -348,6 +353,44 @@ def last_line(output: bytes | str) -> str | None:
         if cleaned:
             return cleaned
     return None
+
+
+def hook_allowed(uid: int, mode: int, is_file: bool) -> bool:
+    """Whether a file may run as a root hook: a regular, executable file owned
+    by root that nobody else can write."""
+    return is_file and uid == 0 and mode & 0o022 == 0 and mode & 0o100 != 0
+
+
+HOOK_SKIPPED_SUFFIXES = (".bak", ".dpkg-new", ".dpkg-old", ".pacnew", ".pacsave", ".swp")
+
+
+def hook_name_allowed(name: str) -> bool:
+    """Names run-parts skips: hidden files and editor or package manager leftovers."""
+    return not name.startswith(".") and not name.endswith("~") and not name.endswith(HOOK_SKIPPED_SUFFIXES)
+
+
+def post_change_hooks(directory: Path) -> list[Path]:
+    """The hooks to run, in name order. A directory root does not own, or that
+    others can write, yields none."""
+    try:
+        info = directory.stat()
+        if not directory.is_dir() or info.st_uid != 0 or info.st_mode & 0o022:
+            return []
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return []
+    hooks = []
+    for path in entries:
+        if not hook_name_allowed(path.name):
+            continue
+        try:
+            # stat follows a symlink: what runs is the target, check that
+            info = path.stat()
+        except OSError:
+            continue
+        if hook_allowed(info.st_uid, info.st_mode, path.is_file()):
+            hooks.append(path)
+    return hooks
 
 
 def run_command(cmd: list[str]) -> str | None:
@@ -1191,11 +1234,13 @@ class TUIApp:
         self.show_busy(stdscr, "Purging old snapshots...")
         deleted, failed = self.snapshot_manager.execute_purge(plan)
         self.invalidate_snapshots()
+        hooks = self.run_post_change_hooks(stdscr) if deleted else ""
 
         if failed:
-            self.set_status(f"Purged {deleted} old snapshots, {failed} could NOT be deleted{skipped}", STATUS_RESULT)
+            self.set_status(f"Purged {deleted} old snapshots, {failed} could NOT be deleted{skipped}{hooks}",
+                            STATUS_RESULT)
         else:
-            self.set_status(f"Purged {deleted} old snapshots{skipped}", STATUS_RESULT)
+            self.set_status(f"Purged {deleted} old snapshots{skipped}{hooks}", STATUS_RESULT)
 
     def handle_clean_broken(self, stdscr):
         if not self.confirm_dialog(stdscr, "Delete all .BROKEN subvolumes?"):
@@ -1225,10 +1270,25 @@ class TUIApp:
         reason = self.create_snapshot(stdscr)
         # even an interrupted run may have created snapshots already
         self.invalidate_snapshots()
+        hooks = self.run_post_change_hooks(stdscr)
         if reason:
-            self.set_status(f"Snapshot creation failed: {reason}", STATUS_RESULT)
+            self.set_status(f"Snapshot creation failed: {reason}{hooks}", STATUS_RESULT)
         else:
-            self.set_status("Snapshots created successfully", STATUS_LONG)
+            self.set_status(f"Snapshots created successfully{hooks}", STATUS_LONG)
+
+    def run_post_change_hooks(self, stdscr) -> str:
+        """Run the post-change hooks. Returns what to add to the status line:
+        nothing when they all succeed (or there are none)."""
+        hooks = post_change_hooks(POST_CHANGE_DIR)
+        if not hooks:
+            return ""
+        self.show_busy(stdscr, "Running post-change hooks...")
+        failures = []
+        for hook in hooks:
+            reason = run_command([str(hook)])
+            if reason:
+                failures.append(f"{hook.name}: {reason}")
+        return f" (hook failed: {'; '.join(failures)})" if failures else ""
 
     def handle_snapshot_selection(self, stdscr, groups):
         """Handle snapshot selection and restoration with dynamic columns."""

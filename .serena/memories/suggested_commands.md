@@ -1,4 +1,4 @@
-# Comandi Suggeriti - BTRBK TUI v2.9
+# Comandi Suggeriti - BTRBK TUI v2.10
 
 ## Esecuzione
 ```bash

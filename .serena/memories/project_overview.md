@@ -1,4 +1,4 @@
-# BTRBK TUI v2.9 - Project Overview
+# BTRBK TUI v2.10 - Project Overview
 
 ## Scopo
 Set completo di strumenti per il ripristino di snapshot Btrfs creati con btrbk. Tre implementazioni con interfacce diverse, configurazione condivisa e parità di funzionalità.
@@ -34,7 +34,8 @@ Set completo di strumenti per il ripristino di snapshot Btrfs creati con btrbk. 
 
 - Snapshot riconosciuti con o senza `@` (timestamp btrbk dopo l'ultimo punto); `--config FILE`
 
-### Stato: Tutte le versioni ✅ Produzione v2.9 (2026-09-24)
+### Stato: Tutte le versioni ✅ Produzione v2.10 (2026-10-26)
+- v2.10: hook root-only in `/etc/btrbk_tui/post-change.d/` dopo purge e `btrbk run` (vedi `mem:latest_changes`)
 
 ### Documentazione esterna
 Nota wiki Joplin dedicata (notebook Backup & Storage): «BTRBK TUI — restore, purge e snapshot btrbk da terminale», id `5e37ad8b6c5542138e3d94ce6903de3c`. Va aggiornata quando cambiano tasti, opzioni da shell o il flusso di restore/purge (poi `wiki log` e `wiki brief --write`).

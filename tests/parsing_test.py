@@ -27,6 +27,21 @@ ssh_user backup
 """
 
 
+class HookTest(unittest.TestCase):
+    def test_hooks_must_be_root_owned_and_private(self):
+        self.assertTrue(tui.hook_allowed(0, 0o100755, True))
+        self.assertTrue(tui.hook_allowed(0, 0o100700, True))
+        self.assertFalse(tui.hook_allowed(1000, 0o100755, True))  # owned by a user
+        self.assertFalse(tui.hook_allowed(0, 0o100775, True))  # group-writable
+        self.assertFalse(tui.hook_allowed(0, 0o100757, True))  # world-writable
+        self.assertFalse(tui.hook_allowed(0, 0o100644, True))  # not executable
+        self.assertFalse(tui.hook_allowed(0, 0o040755, False))  # a directory
+        self.assertTrue(tui.hook_name_allowed("50-btrbk-nas-push-uuids"))
+        self.assertFalse(tui.hook_name_allowed(".hidden"))
+        self.assertFalse(tui.hook_name_allowed("hook~"))
+        self.assertFalse(tui.hook_name_allowed("hook.pacnew"))
+
+
 class SshTargetTest(unittest.TestCase):
     def test_first_target_with_the_options_before_it(self):
         target = tui.parse_ssh_target(CONF)

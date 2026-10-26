@@ -16,6 +16,29 @@ This project provides tools to easily restore Btrfs subvolume snapshots created 
 - System reboot with visual indicators
 - Optionally reboot the system after restoration
 
+## ✨ Features v2.10 - Post-Change Hooks
+
+- **Hooks after the snapshots change**: after a purge that deleted something,
+  and after every snapshot run (`I`, successful or not), both TUIs run the
+  programs in `/etc/btrbk_tui/post-change.d/`, in name order, like `run-parts`.
+  A failing hook is named in the status bar; the operation itself is not undone
+- **Root-owned only**: the tool runs as root, so hooks are not a setting in the
+  user's configuration file — that would let the user run anything as root.
+  A hook runs only if it is a regular executable file owned by root and not
+  writable by group or others (a symlink is judged by its target), inside a
+  directory with the same rules. Hidden files, `~` backups and `.pacnew`/`.bak`
+  leftovers are skipped
+- **What it is for**: btrbk-nas, a Synology package that shows the backups a
+  NAS receives, ships `btrbk-nas-push-uuids`, which tells the NAS which snapshots the PC still holds, so the
+  NAS can show btrbk's next incremental parent. A purge from the TUI or a run
+  started with `I` (which does not go through `btrbk.service`) would otherwise
+  leave that list stale:
+  ```sh
+  sudo install -d -m 755 /etc/btrbk_tui/post-change.d
+  sudo ln -s /usr/local/bin/btrbk-nas-push-uuids /etc/btrbk_tui/post-change.d/50-btrbk-nas
+  ```
+- **16 unit tests per version** (were 15)
+
 ## ✨ Features v2.9 - Works With Any btrbk Layout
 
 Fixes for the problems reported in the issue tracker, in all three versions.

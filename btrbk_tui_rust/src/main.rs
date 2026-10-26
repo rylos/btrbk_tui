@@ -6,6 +6,7 @@ use std::fs;
 use std::ffi::{CStr, OsStr};
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,6 +17,11 @@ use std::time::{Duration, Instant};
 
 /// btrbk configuration, read to discover the backup target
 const BTRBK_CONF: &str = "/etc/btrbk/btrbk.conf";
+/// Programs run after the snapshots change (purge, btrbk run), in name order
+/// like run-parts. Root-owned on purpose: the tool runs as root, and a hook
+/// read from the user's configuration would let that user run anything as
+/// root. btrbk-nas uses one to tell the NAS which snapshots this PC holds.
+const POST_CHANGE_DIR: &str = "/etc/btrbk_tui/post-change.d";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -1003,12 +1009,13 @@ impl App {
         self.show_busy("Purging old snapshots...");
         let (deleted, failed) = self.execute_purge(&plan);
         self.invalidate_snapshots();
+        let hooks = if deleted > 0 { self.run_post_change_hooks() } else { String::new() };
 
         if failed == 0 {
-            self.set_status(&format!("Purged {} old snapshots{}", deleted, skipped), STATUS_RESULT);
+            self.set_status(&format!("Purged {} old snapshots{}{}", deleted, skipped, hooks), STATUS_RESULT);
         } else {
             self.set_status(
-                &format!("Purged {} old snapshots, {} could NOT be deleted{}", deleted, failed, skipped),
+                &format!("Purged {} old snapshots, {} could NOT be deleted{}{}", deleted, failed, skipped, hooks),
                 STATUS_RESULT,
             );
         }
@@ -1046,11 +1053,34 @@ impl App {
         let result = self.create_snapshot();
         // anche un run interrotto può aver già creato degli snapshot
         self.invalidate_snapshots();
+        let hooks = self.run_post_change_hooks();
         match result {
-            Ok(()) => self.set_status("Snapshots created successfully", STATUS_LONG),
+            Ok(()) => self.set_status(&format!("Snapshots created successfully{}", hooks), STATUS_LONG),
             Err(reason) => {
-                self.set_status(&format!("Snapshot creation failed: {}", reason), STATUS_RESULT);
+                self.set_status(&format!("Snapshot creation failed: {}{}", reason, hooks), STATUS_RESULT);
             }
+        }
+    }
+
+    /// Runs the post-change hooks. Returns what to add to the status line:
+    /// nothing when they all succeed (or there are none).
+    fn run_post_change_hooks(&mut self) -> String {
+        let hooks = post_change_hooks(Path::new(POST_CHANGE_DIR));
+        if hooks.is_empty() {
+            return String::new();
+        }
+        self.show_busy("Running post-change hooks...");
+        let failures: Vec<String> = hooks
+            .iter()
+            .filter_map(|hook| {
+                let name = hook.file_name()?.to_string_lossy().into_owned();
+                run_command(&[hook.to_str()?]).err().map(|reason| format!("{}: {}", name, reason))
+            })
+            .collect();
+        if failures.is_empty() {
+            String::new()
+        } else {
+            format!(" (hook failed: {})", failures.join("; "))
         }
     }
 
@@ -1624,6 +1654,40 @@ fn local_subvolume_uuid(path: &Path) -> Option<String> {
     parse_subvolume_uuid(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Whether a file may run as a root hook: a regular, executable file owned by
+/// root that nobody else can write.
+fn hook_allowed(uid: u32, mode: u32, is_file: bool) -> bool {
+    is_file && uid == 0 && mode & 0o022 == 0 && mode & 0o100 != 0
+}
+
+/// Names run-parts skips: hidden files and editor or package manager leftovers.
+fn hook_name_allowed(name: &str) -> bool {
+    !name.starts_with('.')
+        && !name.ends_with('~')
+        && ![".bak", ".dpkg-new", ".dpkg-old", ".pacnew", ".pacsave", ".swp"].iter().any(|ext| name.ends_with(ext))
+}
+
+/// The hooks to run, in name order. A directory root does not own, or that
+/// others can write, yields none.
+fn post_change_hooks(dir: &Path) -> Vec<PathBuf> {
+    let dir_ok = fs::metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o022 == 0);
+    if !dir_ok {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut hooks: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(hook_name_allowed))
+        .map(|e| e.path())
+        // metadata follows a symlink: what runs is the target, check that
+        .filter(|path| fs::metadata(path).is_ok_and(|m| hook_allowed(m.uid(), m.mode(), m.is_file())))
+        .collect();
+    hooks.sort();
+    hooks
+}
+
 /// Last non-empty line of a command's output, cleaned for display.
 fn last_line(output: &[u8]) -> Option<String> {
     String::from_utf8_lossy(output)
@@ -1805,6 +1869,21 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hooks_must_be_root_owned_and_private() {
+        assert!(hook_allowed(0, 0o100755, true));
+        assert!(hook_allowed(0, 0o100700, true));
+        assert!(!hook_allowed(1000, 0o100755, true), "owned by a user");
+        assert!(!hook_allowed(0, 0o100775, true), "group-writable");
+        assert!(!hook_allowed(0, 0o100757, true), "world-writable");
+        assert!(!hook_allowed(0, 0o100644, true), "not executable");
+        assert!(!hook_allowed(0, 0o040755, false), "a directory");
+        assert!(hook_name_allowed("50-btrbk-nas-push-uuids"));
+        assert!(!hook_name_allowed(".hidden"));
+        assert!(!hook_name_allowed("hook~"));
+        assert!(!hook_name_allowed("hook.pacnew"));
+    }
 
     const CONF: &str = "\
 transaction_log            /var/log/btrbk.log
